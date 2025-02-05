@@ -4,6 +4,11 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use std::{cell::RefCell, rc::Rc};
+
+use neqo_common::{event::Provider as _, Datagram};
+use test_fixture::now;
+
 use super::{
     super::{Connection, Error, Output},
     connect, default_client, default_server, fill_cwnd, maybe_authenticate,
@@ -13,10 +18,6 @@ use crate::{
     send_stream::{RetransmissionPriority, TransmissionPriority},
     ConnectionEvent, StreamId, StreamType,
 };
-
-use neqo_common::event::Provider;
-use std::{cell::RefCell, mem, rc::Rc};
-use test_fixture::{self, now};
 
 const BLOCK_SIZE: usize = 4_096;
 
@@ -200,18 +201,31 @@ fn repairing_loss() {
     ));
 }
 
-#[test]
-fn critical() {
+fn connect_for_0rtt() -> (Connection, Connection) {
     let mut client = default_client();
     let mut server = default_server();
-    let now = now();
 
     // Rather than connect, send stream data in 0.5-RTT.
-    // That allows this to test that critical streams pre-empt most frame types.
-    let dgram = client.process_output(now).dgram();
-    let dgram = server.process(dgram, now).dgram();
-    client.process_input(dgram.unwrap(), now);
-    maybe_authenticate(&mut client);
+    // That allows this to test that critical streams preempt most frame types.
+    let dgram = client.process_output(now()).dgram();
+    let dgram2 = client.process_output(now()).dgram();
+    server.process_input(dgram.unwrap(), now());
+    let dgram = server.process(dgram2, now()).dgram();
+    client.process_input(dgram.unwrap(), now());
+    (client, server)
+}
+
+fn complete_handshake(client: &mut Connection, server: &mut Connection, dgram: Option<Datagram>) {
+    let dgram = client.process(dgram, now()).dgram();
+    maybe_authenticate(client);
+    let dgram = server.process(dgram, now()).dgram();
+    let dgram = client.process(dgram, now()).dgram();
+    server.process_input(dgram.unwrap(), now());
+}
+
+#[test]
+fn critical() {
+    let (mut client, mut server) = connect_for_0rtt();
 
     let id = server.stream_create(StreamType::UniDi).unwrap();
     server
@@ -228,21 +242,20 @@ fn critical() {
 
     fill_stream(&mut server, id);
     let stats_before = server.stats().frame_tx;
-    let dgram = server.process_output(now).dgram();
+    let dgram = server.process_output(now()).dgram();
     let stats_after = server.stats().frame_tx;
-    assert_eq!(stats_after.crypto, stats_before.crypto);
+    assert_eq!(stats_after.crypto, stats_before.crypto + 2);
     assert_eq!(stats_after.streams_blocked, 0);
     assert_eq!(stats_after.new_connection_id, 0);
     assert_eq!(stats_after.new_token, 0);
     assert_eq!(stats_after.handshake_done, 0);
 
     // Complete the handshake.
-    let dgram = client.process(dgram, now).dgram();
-    server.process_input(dgram.unwrap(), now);
+    complete_handshake(&mut client, &mut server, dgram);
 
     // Critical beats everything but HANDSHAKE_DONE.
     let stats_before = server.stats().frame_tx;
-    mem::drop(fill_cwnd(&mut server, id, now));
+    drop(fill_cwnd(&mut server, id, now()));
     let stats_after = server.stats().frame_tx;
     assert_eq!(stats_after.crypto, stats_before.crypto);
     assert_eq!(stats_after.streams_blocked, 0);
@@ -253,16 +266,7 @@ fn critical() {
 
 #[test]
 fn important() {
-    let mut client = default_client();
-    let mut server = default_server();
-    let now = now();
-
-    // Rather than connect, send stream data in 0.5-RTT.
-    // That allows this to test that important streams pre-empt most frame types.
-    let dgram = client.process_output(now).dgram();
-    let dgram = server.process(dgram, now).dgram();
-    client.process_input(dgram.unwrap(), now);
-    maybe_authenticate(&mut client);
+    let (mut client, mut server) = connect_for_0rtt();
 
     let id = server.stream_create(StreamType::UniDi).unwrap();
     server
@@ -279,9 +283,9 @@ fn important() {
     while server.stream_create(StreamType::UniDi).is_ok() {}
 
     let stats_before = server.stats().frame_tx;
-    let dgram = server.process_output(now).dgram();
+    let dgram = server.process_output(now()).dgram();
     let stats_after = server.stats().frame_tx;
-    assert_eq!(stats_after.crypto, stats_before.crypto);
+    assert_eq!(stats_after.crypto, stats_before.crypto + 2);
     assert_eq!(stats_after.streams_blocked, 1);
     assert_eq!(stats_after.new_connection_id, 0);
     assert_eq!(stats_after.new_token, 0);
@@ -289,12 +293,11 @@ fn important() {
     assert_eq!(stats_after.stream, stats_before.stream + 1);
 
     // Complete the handshake.
-    let dgram = client.process(dgram, now).dgram();
-    server.process_input(dgram.unwrap(), now);
+    complete_handshake(&mut client, &mut server, dgram);
 
     // Important beats everything but flow control.
     let stats_before = server.stats().frame_tx;
-    mem::drop(fill_cwnd(&mut server, id, now));
+    drop(fill_cwnd(&mut server, id, now()));
     let stats_after = server.stats().frame_tx;
     assert_eq!(stats_after.crypto, stats_before.crypto);
     assert_eq!(stats_after.streams_blocked, 1);
@@ -306,16 +309,7 @@ fn important() {
 
 #[test]
 fn high_normal() {
-    let mut client = default_client();
-    let mut server = default_server();
-    let now = now();
-
-    // Rather than connect, send stream data in 0.5-RTT.
-    // That allows this to test that important streams pre-empt most frame types.
-    let dgram = client.process_output(now).dgram();
-    let dgram = server.process(dgram, now).dgram();
-    client.process_input(dgram.unwrap(), now);
-    maybe_authenticate(&mut client);
+    let (mut client, mut server) = connect_for_0rtt();
 
     let id = server.stream_create(StreamType::UniDi).unwrap();
     server
@@ -332,9 +326,9 @@ fn high_normal() {
     while server.stream_create(StreamType::UniDi).is_ok() {}
 
     let stats_before = server.stats().frame_tx;
-    let dgram = server.process_output(now).dgram();
+    let dgram = server.process_output(now()).dgram();
     let stats_after = server.stats().frame_tx;
-    assert_eq!(stats_after.crypto, stats_before.crypto);
+    assert_eq!(stats_after.crypto, stats_before.crypto + 2);
     assert_eq!(stats_after.streams_blocked, 1);
     assert_eq!(stats_after.new_connection_id, 0);
     assert_eq!(stats_after.new_token, 0);
@@ -342,14 +336,13 @@ fn high_normal() {
     assert_eq!(stats_after.stream, stats_before.stream + 1);
 
     // Complete the handshake.
-    let dgram = client.process(dgram, now).dgram();
-    server.process_input(dgram.unwrap(), now);
+    complete_handshake(&mut client, &mut server, dgram);
 
     // High or Normal doesn't beat NEW_CONNECTION_ID,
     // but they beat CRYPTO/NEW_TOKEN.
     let stats_before = server.stats().frame_tx;
-    server.send_ticket(now, &[]).unwrap();
-    mem::drop(fill_cwnd(&mut server, id, now));
+    server.send_ticket(now(), &[]).unwrap();
+    drop(fill_cwnd(&mut server, id, now()));
     let stats_after = server.stats().frame_tx;
     assert_eq!(stats_after.crypto, stats_before.crypto);
     assert_eq!(stats_after.streams_blocked, 1);
@@ -369,7 +362,7 @@ fn low() {
     let validation = Rc::new(RefCell::new(
         AddressValidation::new(now, ValidateAddress::Never).unwrap(),
     ));
-    server.set_validation(Rc::clone(&validation));
+    server.set_validation(&validation);
     connect(&mut client, &mut server);
 
     let id = server.stream_create(StreamType::UniDi).unwrap();
@@ -385,8 +378,8 @@ fn low() {
     // Send a session ticket and make it big enough to require a whole packet.
     // The resulting CRYPTO frame beats out the stream data.
     let stats_before = server.stats().frame_tx;
-    server.send_ticket(now, &[0; 2048]).unwrap();
-    mem::drop(server.process_output(now));
+    server.send_ticket(now, &vec![0; server.plpmtu()]).unwrap();
+    drop(server.process_output(now));
     let stats_after = server.stats().frame_tx;
     assert_eq!(stats_after.crypto, stats_before.crypto + 1);
     assert_eq!(stats_after.stream, stats_before.stream);
@@ -395,7 +388,7 @@ fn low() {
     // it is very hard to ensure that the STREAM frame won't also fit.
     // However, we can ensure that the next packet doesn't consist of just STREAM.
     let stats_before = server.stats().frame_tx;
-    mem::drop(server.process_output(now));
+    drop(server.process_output(now));
     let stats_after = server.stats().frame_tx;
     assert_eq!(stats_after.crypto, stats_before.crypto + 1);
     assert_eq!(stats_after.new_token, 1);

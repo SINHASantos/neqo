@@ -1,27 +1,43 @@
 [package]
 name = "neqo-crypto"
-version = "0.6.8"
-authors = ["Martin Thomson <mt@lowentropy.net>"]
-edition = "2018"
-rust-version = "1.65.0"
-build = "build.rs"
-license = "MIT OR Apache-2.0"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
+# Checked against https://searchfox.org/mozilla-central/source/Cargo.lock 2024-11-11
+log = { workspace = true }
 neqo-common = { path = "../neqo-common" }
-log = {version = "0.4.0", default-features = false}
 
 [build-dependencies]
-bindgen = {version = "0.64", default-features = false, features= ["runtime"]}
-serde = "1.0"
-serde_derive = "1.0"
-toml = "0.5"
-mozbuild = {version = "0.1", optional = true}
+# Checked against https://searchfox.org/mozilla-central/source/Cargo.lock 2024-11-11
+bindgen = { version = "0.69", default-features = false, features = ["runtime"] }
+mozbuild = { version = "0.1", default-features = false, optional = true }
+semver = { version = "1.0", default-features = false }
+serde = { version = "1.0", default-features = false }
+serde_derive = { version = "1.0", default-features = false }
+toml = { version = "0.5", default-features = false }
 
 [dev-dependencies]
 test-fixture = { path = "../test-fixture" }
 
 [features]
-deny-warnings = []
+bench = []
+disable-encryption = []
+disable-random = []
 gecko = ["mozbuild"]
-fuzzing = []
+
+[lib]
+# See https://github.com/bheisler/criterion.rs/blob/master/book/src/faq.md#cargo-bench-gives-unrecognized-option-errors-for-valid-command-line-options
+bench = false

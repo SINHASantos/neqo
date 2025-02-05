@@ -1,20 +1,22 @@
-#![cfg_attr(feature = "deny-warnings", deny(warnings))]
-#![warn(clippy::pedantic)]
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
 
 use neqo_crypto::{
     generate_ech_keys, AuthenticationStatus, Client, Error, HandshakeState, SecretAgentPreInfo,
     Server, ZeroRttCheckResult, ZeroRttChecker, TLS_AES_128_GCM_SHA256,
-    TLS_CHACHA20_POLY1305_SHA256, TLS_GRP_EC_SECP256R1, TLS_VERSION_1_3,
+    TLS_CHACHA20_POLY1305_SHA256, TLS_GRP_EC_SECP256R1, TLS_GRP_EC_X25519, TLS_VERSION_1_3,
 };
 
-use std::boxed::Box;
-
 mod handshake;
+use test_fixture::{fixture_init, now};
+
 use crate::handshake::{
     connect, connect_fail, forward_records, resumption_setup, PermissiveZeroRttChecker, Resumption,
     ZERO_RTT_TOKEN_DATA,
 };
-use test_fixture::{fixture_init, now};
 
 #[test]
 fn make_client() {
@@ -76,7 +78,7 @@ fn check_client_preinfo(client_preinfo: &SecretAgentPreInfo) {
     assert_eq!(client_preinfo.cipher_suite(), None);
     assert!(!client_preinfo.early_data());
     assert_eq!(client_preinfo.early_data_cipher(), None);
-    assert_eq!(client_preinfo.max_early_data(), 0);
+    assert_eq!(client_preinfo.max_early_data(), Ok(0));
     assert_eq!(client_preinfo.alpn(), None);
 }
 
@@ -85,7 +87,7 @@ fn check_server_preinfo(server_preinfo: &SecretAgentPreInfo) {
     assert_eq!(server_preinfo.cipher_suite(), Some(TLS_AES_128_GCM_SHA256));
     assert!(!server_preinfo.early_data());
     assert_eq!(server_preinfo.early_data_cipher(), None);
-    assert_eq!(server_preinfo.max_early_data(), 0);
+    assert_eq!(server_preinfo.max_early_data(), Ok(0));
     assert_eq!(server_preinfo.alpn(), None);
 }
 
@@ -127,8 +129,8 @@ fn raw() {
     assert!(server.state().is_connected());
 
     // The client should have one certificate for the server.
-    let mut certs = client.peer_certificate().unwrap();
-    assert_eq!(1, certs.count());
+    let certs = client.peer_certificate().unwrap();
+    assert_eq!(1, certs.into_iter().count());
 
     // The server shouldn't have a client certificate.
     assert!(server.peer_certificate().is_none());
@@ -156,6 +158,48 @@ fn chacha_client() {
 }
 
 #[test]
+fn server_prefers_first_client_share() {
+    fixture_init();
+    let mut client = Client::new("server.example", true).expect("should create client");
+    let mut server = Server::new(&["key"]).expect("should create server");
+    server
+        .set_groups(&[TLS_GRP_EC_X25519, TLS_GRP_EC_SECP256R1])
+        .expect("groups set");
+    client
+        .set_groups(&[TLS_GRP_EC_X25519, TLS_GRP_EC_SECP256R1])
+        .expect("groups set");
+    client
+        .send_additional_key_shares(1)
+        .expect("should set additional key share count");
+
+    connect(&mut client, &mut server);
+
+    assert_eq!(client.info().unwrap().key_exchange(), TLS_GRP_EC_X25519);
+    assert_eq!(server.info().unwrap().key_exchange(), TLS_GRP_EC_X25519);
+}
+
+#[test]
+fn server_prefers_second_client_share() {
+    fixture_init();
+    let mut client = Client::new("server.example", true).expect("should create client");
+    let mut server = Server::new(&["key"]).expect("should create server");
+    server
+        .set_groups(&[TLS_GRP_EC_SECP256R1, TLS_GRP_EC_X25519])
+        .expect("groups set");
+    client
+        .set_groups(&[TLS_GRP_EC_X25519, TLS_GRP_EC_SECP256R1])
+        .expect("groups set");
+    client
+        .send_additional_key_shares(1)
+        .expect("should set additional key share count");
+
+    connect(&mut client, &mut server);
+
+    assert_eq!(client.info().unwrap().key_exchange(), TLS_GRP_EC_SECP256R1);
+    assert_eq!(server.info().unwrap().key_exchange(), TLS_GRP_EC_SECP256R1);
+}
+
+#[test]
 fn p256_server() {
     fixture_init();
     let mut client = Client::new("server.example", true).expect("should create client");
@@ -163,6 +207,27 @@ fn p256_server() {
     server
         .set_groups(&[TLS_GRP_EC_SECP256R1])
         .expect("groups set");
+
+    connect(&mut client, &mut server);
+
+    assert_eq!(client.info().unwrap().key_exchange(), TLS_GRP_EC_SECP256R1);
+    assert_eq!(server.info().unwrap().key_exchange(), TLS_GRP_EC_SECP256R1);
+}
+
+#[test]
+fn p256_server_hrr() {
+    fixture_init();
+    let mut client = Client::new("server.example", true).expect("should create client");
+    let mut server = Server::new(&["key"]).expect("should create server");
+    server
+        .set_groups(&[TLS_GRP_EC_SECP256R1])
+        .expect("groups set");
+    client
+        .set_groups(&[TLS_GRP_EC_X25519, TLS_GRP_EC_SECP256R1])
+        .expect("groups set");
+    client
+        .send_additional_key_shares(0)
+        .expect("should set additional key share count");
 
     connect(&mut client, &mut server);
 

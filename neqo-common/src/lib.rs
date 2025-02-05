@@ -4,27 +4,33 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-#![cfg_attr(feature = "deny-warnings", deny(warnings))]
-#![warn(clippy::pedantic)]
+#![allow(clippy::module_name_repetitions)] // This lint doesn't work here.
 
 mod codec;
 mod datagram;
 pub mod event;
+#[cfg(feature = "build-fuzzing-corpus")]
+mod fuzz;
 pub mod header;
 pub mod hrtime;
 mod incrdecoder;
 pub mod log;
 pub mod qlog;
-pub mod timer;
+pub mod tos;
 
-pub use self::codec::{Decoder, Encoder};
-pub use self::datagram::Datagram;
-pub use self::header::Header;
-pub use self::incrdecoder::{
-    IncrementalDecoderBuffer, IncrementalDecoderIgnore, IncrementalDecoderUint,
+use std::fmt::Write as _;
+
+use enum_map::Enum;
+
+#[cfg(feature = "build-fuzzing-corpus")]
+pub use self::fuzz::write_item_to_fuzzing_corpus;
+pub use self::{
+    codec::{Decoder, Encoder},
+    datagram::Datagram,
+    header::Header,
+    incrdecoder::{IncrementalDecoderBuffer, IncrementalDecoderIgnore, IncrementalDecoderUint},
+    tos::{IpTos, IpTosDscp, IpTosEcn},
 };
-
-use std::fmt::Write;
 
 #[must_use]
 pub fn hex(buf: impl AsRef<[u8]>) -> String {
@@ -75,7 +81,7 @@ pub const fn const_min(a: usize, b: usize) -> usize {
     [a, b][(a >= b) as usize]
 }
 
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone, Enum)]
 /// Client or Server.
 pub enum Role {
     Client,
@@ -84,7 +90,7 @@ pub enum Role {
 
 impl Role {
     #[must_use]
-    pub fn remote(self) -> Self {
+    pub const fn remote(self) -> Self {
         match self {
             Self::Client => Self::Server,
             Self::Server => Self::Client,

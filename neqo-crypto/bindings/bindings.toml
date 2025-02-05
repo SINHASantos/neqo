@@ -45,10 +45,10 @@ functions = [
     "SSL_OptionSet",
     "SSL_OptionGetDefault",
     "SSL_PeerCertificate",
-    "SSL_PeerCertificateChain",
     "SSL_PeerSignedCertTimestamps",
     "SSL_PeerStapledOCSPResponses",
     "SSL_ResetHandshake",
+    "SSL_SendAdditionalKeyShares",
     "SSL_SetNextProtoNego",
     "SSL_SetURL",
     "SSL_VersionRangeSet",
@@ -103,6 +103,7 @@ variables = [
     "SSL_ENABLE_HELLO_DOWNGRADE_CHECK",
     "SSL_SUPPRESS_END_OF_EARLY_DATA",
     "SSL_ENABLE_GREASE",
+    "SSL_ENABLE_CH_EXTENSION_PERMUTATION"
 ]
 
 [nss_ciphers]
@@ -136,8 +137,6 @@ variables = [
 
 [nss_p11]
 types = [
-    "CERTCertList",
-    "CERTCertListNode",
     "CK_CHACHA20_PARAMS",
     "CK_ATTRIBUTE_TYPE",
     "CK_FLAGS",
@@ -150,8 +149,8 @@ types = [
 ]
 functions = [
     "CERT_DestroyCertificate",
-    "CERT_DestroyCertList",
     "CERT_GetCertificateDer",
+    "NSS_SetAlgorithmPolicy",
     "PK11_CipherOp",
     "PK11_CreateContextBySymKey",
     "PK11_DestroyContext",
@@ -171,6 +170,7 @@ functions = [
     "PK11_ImportDataKey",
     "PK11_ReadRawAttribute",
     "PK11_ReferenceSymKey",
+    "SECITEM_FreeArray",
     "SECITEM_FreeItem",
     "SECKEY_CopyPrivateKey",
     "SECKEY_CopyPublicKey",
@@ -207,6 +207,7 @@ variables = [
     "CKM_EC_KEY_PAIR_GEN",
     "CKM_HKDF_DERIVE",
     "CKM_INVALID_MECHANISM",
+    "NSS_USE_ALG_IN_SSL_KX",
     "PK11_ATTR_INSENSITIVE",
     "PK11_ATTR_PRIVATE",
     "PK11_ATTR_PUBLIC",
@@ -264,8 +265,3 @@ enums = [
 [nspr_time]
 types = ["PRTime"]
 functions = ["PR_Now"]
-
-[mozpkix]
-cplusplus = true
-types = ["mozilla::pkix::ErrorCode"]
-enums = ["mozilla::pkix::ErrorCode"]

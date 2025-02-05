@@ -5,10 +5,7 @@
 // except according to those terms.
 
 // Tracking of some useful statistics.
-#![deny(clippy::pedantic)]
 
-use crate::packet::PacketNumber;
-use neqo_common::qinfo;
 use std::{
     cell::RefCell,
     fmt::{self, Debug},
@@ -17,13 +14,15 @@ use std::{
     time::Duration,
 };
 
-pub(crate) const MAX_PTO_COUNTS: usize = 16;
+use neqo_common::qwarn;
+
+use crate::{ecn, packet::PacketNumber};
+
+pub const MAX_PTO_COUNTS: usize = 16;
 
 #[derive(Default, Clone)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
-#[allow(clippy::module_name_repetitions)]
 pub struct FrameStats {
-    pub all: usize,
     pub ack: usize,
     pub largest_acknowledged: PacketNumber,
 
@@ -96,9 +95,36 @@ impl Debug for FrameStats {
     }
 }
 
+#[cfg(test)]
+impl FrameStats {
+    pub const fn all(&self) -> usize {
+        self.ack
+            + self.crypto
+            + self.stream
+            + self.reset_stream
+            + self.stop_sending
+            + self.ping
+            + self.padding
+            + self.max_streams
+            + self.streams_blocked
+            + self.max_data
+            + self.data_blocked
+            + self.max_stream_data
+            + self.stream_data_blocked
+            + self.new_connection_id
+            + self.retire_connection_id
+            + self.path_challenge
+            + self.path_response
+            + self.connection_close
+            + self.handshake_done
+            + self.new_token
+            + self.ack_frequency
+            + self.datagram
+    }
+}
+
 /// Datagram stats
 #[derive(Default, Clone)]
-#[allow(clippy::module_name_repetitions)]
 pub struct DatagramStats {
     /// The number of datagrams declared lost.
     pub lost: usize,
@@ -111,7 +137,6 @@ pub struct DatagramStats {
 
 /// Connection statistics
 #[derive(Default, Clone)]
-#[allow(clippy::module_name_repetitions)]
 pub struct Stats {
     info: String,
 
@@ -133,6 +158,18 @@ pub struct Stats {
     /// Acknowledgments for packets that contained data that was marked
     /// for retransmission when the PTO timer popped.
     pub pto_ack: usize,
+    /// Number of PMTUD probes sent.
+    pub pmtud_tx: usize,
+    /// Number of PMTUD probes ACK'ed.
+    pub pmtud_ack: usize,
+    /// Number of PMTUD probes lost.
+    pub pmtud_lost: usize,
+    /// Number of times a path MTU changed unexpectedly.
+    pub pmtud_change: usize,
+    /// MTU of the local interface used for the most recent path.
+    pub pmtud_iface_mtu: usize,
+    /// Probed PMTU of the current path.
+    pub pmtud_pmtu: usize,
 
     /// Whether the connection was resumed successfully.
     pub resumed: bool,
@@ -141,6 +178,8 @@ pub struct Stats {
     pub rtt: Duration,
     /// The current, estimated round-trip time variation on the primary path.
     pub rttvar: Duration,
+    /// Whether the first RTT sample was guessed from a discarded packet.
+    pub rtt_init_guess: bool,
 
     /// Count PTOs. Single PTOs, 2 PTOs in a row, 3 PTOs in row, etc. are counted
     /// separately.
@@ -156,6 +195,23 @@ pub struct Stats {
     pub incoming_datagram_dropped: usize,
 
     pub datagram_tx: DatagramStats,
+
+    /// ECN path validation count, indexed by validation outcome.
+    pub ecn_path_validation: ecn::ValidationCount,
+    /// ECN counts for outgoing UDP datagrams, returned by remote through QUIC ACKs.
+    ///
+    /// Note: Given that QUIC ACKs only carry [`Ect0`], [`Ect1`] and [`Ce`], but
+    /// never [`NotEct`], the [`NotEct`] value will always be 0.
+    ///
+    /// See also <https://www.rfc-editor.org/rfc/rfc9000.html#section-19.3.2>.
+    ///
+    /// [`Ect0`]: neqo_common::tos::IpTosEcn::Ect0
+    /// [`Ect1`]: neqo_common::tos::IpTosEcn::Ect1
+    /// [`Ce`]: neqo_common::tos::IpTosEcn::Ce
+    /// [`NotEct`]: neqo_common::tos::IpTosEcn::NotEct
+    pub ecn_tx: ecn::Count,
+    /// ECN counts for incoming UDP datagrams, read from IP TOS header.
+    pub ecn_rx: ecn::Count,
 }
 
 impl Stats {
@@ -165,15 +221,16 @@ impl Stats {
 
     pub fn pkt_dropped(&mut self, reason: impl AsRef<str>) {
         self.dropped_rx += 1;
-        qinfo!(
-            [self.info],
-            "Dropped received packet: {}; Total: {}",
+        qwarn!(
+            "[{}] Dropped received packet: {}; Total: {}",
+            self.info,
             reason.as_ref(),
             self.dropped_rx
         );
     }
 
     /// # Panics
+    ///
     /// When preconditions are violated.
     pub fn add_pto_count(&mut self, count: usize) {
         debug_assert!(count > 0);
@@ -202,16 +259,30 @@ impl Debug for Stats {
             "  tx: {} lost {} lateack {} ptoack {}",
             self.packets_tx, self.lost, self.late_ack, self.pto_ack
         )?;
-        writeln!(f, "  resumed: {} ", self.resumed)?;
+        writeln!(
+            f,
+            "  pmtud: {} sent {} acked {} lost {} change {} iface_mtu {} pmtu",
+            self.pmtud_tx,
+            self.pmtud_ack,
+            self.pmtud_lost,
+            self.pmtud_change,
+            self.pmtud_iface_mtu,
+            self.pmtud_pmtu
+        )?;
+        writeln!(f, "  resumed: {}", self.resumed)?;
         writeln!(f, "  frames rx:")?;
         self.frame_rx.fmt(f)?;
         writeln!(f, "  frames tx:")?;
-        self.frame_tx.fmt(f)
+        self.frame_tx.fmt(f)?;
+        writeln!(
+            f,
+            "  ecn: {:?} for tx {:?} for rx {:?} path validation outcomes",
+            self.ecn_tx, self.ecn_rx, self.ecn_path_validation,
+        )
     }
 }
 
 #[derive(Default, Clone)]
-#[allow(clippy::module_name_repetitions)]
 pub struct StatsCell {
     stats: Rc<RefCell<Stats>>,
 }

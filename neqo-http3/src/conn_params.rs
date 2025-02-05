@@ -4,9 +4,10 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use std::cmp::min;
+
 use neqo_qpack::QpackSettings;
 use neqo_transport::ConnectionParameters;
-use std::cmp::min;
 
 const QPACK_MAX_TABLE_SIZE_DEFAULT: u64 = 65536;
 const QPACK_TABLE_SIZE_LIMIT: u64 = (1 << 30) - 1;
@@ -42,7 +43,7 @@ impl Default for Http3Parameters {
 
 impl Http3Parameters {
     #[must_use]
-    pub fn get_connection_parameters(&self) -> &ConnectionParameters {
+    pub const fn get_connection_parameters(&self) -> &ConnectionParameters {
         &self.conn_params
     }
 
@@ -53,6 +54,7 @@ impl Http3Parameters {
     }
 
     /// # Panics
+    ///
     /// The table size must be smaller than 1 << 30 by the spec.
     #[must_use]
     pub fn max_table_size_encoder(mut self, mut max_table: u64) -> Self {
@@ -63,11 +65,12 @@ impl Http3Parameters {
     }
 
     #[must_use]
-    pub fn get_max_table_size_encoder(&self) -> u64 {
+    pub const fn get_max_table_size_encoder(&self) -> u64 {
         self.qpack_settings.max_table_size_encoder
     }
 
     /// # Panics
+    ///
     /// The table size must be smaller than 1 << 30 by the spec.
     #[must_use]
     pub fn max_table_size_decoder(mut self, mut max_table: u64) -> Self {
@@ -78,56 +81,56 @@ impl Http3Parameters {
     }
 
     #[must_use]
-    pub fn get_max_table_size_decoder(&self) -> u64 {
+    pub const fn get_max_table_size_decoder(&self) -> u64 {
         self.qpack_settings.max_table_size_decoder
     }
 
     #[must_use]
-    pub fn max_blocked_streams(mut self, max_blocked: u16) -> Self {
+    pub const fn max_blocked_streams(mut self, max_blocked: u16) -> Self {
         self.qpack_settings.max_blocked_streams = max_blocked;
         self
     }
 
     #[must_use]
-    pub fn get_max_blocked_streams(&self) -> u16 {
+    pub const fn get_max_blocked_streams(&self) -> u16 {
         self.qpack_settings.max_blocked_streams
     }
 
     #[must_use]
-    pub fn get_qpack_settings(&self) -> &QpackSettings {
+    pub const fn get_qpack_settings(&self) -> &QpackSettings {
         &self.qpack_settings
     }
 
     #[must_use]
-    pub fn max_concurrent_push_streams(mut self, max_push_streams: u64) -> Self {
+    pub const fn max_concurrent_push_streams(mut self, max_push_streams: u64) -> Self {
         self.max_concurrent_push_streams = max_push_streams;
         self
     }
 
     #[must_use]
-    pub fn get_max_concurrent_push_streams(&self) -> u64 {
+    pub const fn get_max_concurrent_push_streams(&self) -> u64 {
         self.max_concurrent_push_streams
     }
 
     #[must_use]
-    pub fn webtransport(mut self, webtransport: bool) -> Self {
+    pub const fn webtransport(mut self, webtransport: bool) -> Self {
         self.webtransport = webtransport;
         self
     }
 
     #[must_use]
-    pub fn get_webtransport(&self) -> bool {
+    pub const fn get_webtransport(&self) -> bool {
         self.webtransport
     }
 
     #[must_use]
-    pub fn http3_datagram(mut self, http3_datagram: bool) -> Self {
+    pub const fn http3_datagram(mut self, http3_datagram: bool) -> Self {
         self.http3_datagram = http3_datagram;
         self
     }
 
     #[must_use]
-    pub fn get_http3_datagram(&self) -> bool {
+    pub const fn get_http3_datagram(&self) -> bool {
         self.http3_datagram
     }
 }

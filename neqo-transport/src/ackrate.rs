@@ -5,18 +5,15 @@
 // except according to those terms.
 
 // Management of the peer's ack rate.
-#![deny(clippy::pedantic)]
 
-use crate::connection::params::ACK_RATIO_SCALE;
-use crate::frame::FRAME_TYPE_ACK_FREQUENCY;
-use crate::packet::PacketBuilder;
-use crate::recovery::RecoveryToken;
-use crate::stats::FrameStats;
+use std::{cmp::max, time::Duration};
 
 use neqo_common::qtrace;
-use std::cmp::max;
-use std::convert::TryFrom;
-use std::time::Duration;
+
+use crate::{
+    connection::params::ACK_RATIO_SCALE, frame::FRAME_TYPE_ACK_FREQUENCY, packet::PacketBuilder,
+    recovery::RecoveryToken, stats::FrameStats,
+};
 
 #[derive(Debug, Clone)]
 pub struct AckRate {
@@ -40,7 +37,7 @@ impl AckRate {
         let packets = packets.clamp(MIN_PACKETS, MAX_PACKETS) - 1;
         let delay = rtt * RTT_RATIO / u32::from(ratio);
         let delay = delay.clamp(minimum, MAX_DELAY);
-        qtrace!("AckRate inputs: {}/{}/{}, {:?}", cwnd, mtu, ratio, rtt);
+        qtrace!("AckRate inputs: {cwnd}/{mtu}/{ratio}, {rtt:?}");
         Self { packets, delay }
     }
 
@@ -48,8 +45,8 @@ impl AckRate {
         builder.write_varint_frame(&[
             FRAME_TYPE_ACK_FREQUENCY,
             seqno,
-            u64::try_from(self.packets + 1).unwrap(),
-            u64::try_from(self.delay.as_micros()).unwrap(),
+            u64::try_from(self.packets + 1).expect("usize fits in u64"),
+            u64::try_from(self.delay.as_micros()).unwrap_or(u64::MAX),
             0,
         ])
     }
@@ -85,12 +82,7 @@ impl FlexibleAckRate {
         mtu: usize,
         rtt: Duration,
     ) -> Self {
-        qtrace!(
-            "FlexibleAckRate: {:?} {:?} {}",
-            max_ack_delay,
-            min_ack_delay,
-            ratio
-        );
+        qtrace!("FlexibleAckRate: {max_ack_delay:?} {min_ack_delay:?} {ratio}");
         let ratio = max(ACK_RATIO_SCALE, ratio); // clamp it
         Self {
             current: AckRate {
@@ -149,7 +141,7 @@ pub enum PeerAckDelay {
 }
 
 impl PeerAckDelay {
-    pub fn fixed(max_ack_delay: Duration) -> Self {
+    pub const fn fixed(max_ack_delay: Duration) -> Self {
         Self::Fixed(max_ack_delay)
     }
 

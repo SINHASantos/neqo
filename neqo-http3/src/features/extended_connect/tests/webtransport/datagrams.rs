@@ -4,13 +4,15 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use crate::features::extended_connect::tests::webtransport::{
-    wt_default_parameters, WtTest, DATAGRAM_SIZE,
-};
-use crate::{Error, Http3Parameters, WebTransportRequest};
 use neqo_common::Encoder;
 use neqo_transport::Error as TransportError;
-use std::convert::TryFrom;
+
+use crate::{
+    features::extended_connect::tests::webtransport::{
+        wt_default_parameters, WtTest, DATAGRAM_SIZE,
+    },
+    Error, Http3Parameters, WebTransportRequest,
+};
 
 const DGRAM: &[u8] = &[0, 100];
 
@@ -20,7 +22,7 @@ fn no_datagrams() {
         Http3Parameters::default().webtransport(true),
         Http3Parameters::default().webtransport(true),
     );
-    let mut wt_session = wt.create_wt_session();
+    let wt_session = wt.create_wt_session();
 
     assert_eq!(
         wt_session.max_datagram_size(),
@@ -45,7 +47,7 @@ fn no_datagrams() {
     wt.check_no_datagram_received_server();
 }
 
-fn do_datagram_test(wt: &mut WtTest, wt_session: &mut WebTransportRequest) {
+fn do_datagram_test(wt: &mut WtTest, wt_session: &WebTransportRequest) {
     assert_eq!(
         wt_session.max_datagram_size(),
         Ok(DATAGRAM_SIZE
@@ -68,8 +70,8 @@ fn do_datagram_test(wt: &mut WtTest, wt_session: &mut WebTransportRequest) {
 #[test]
 fn datagrams() {
     let mut wt = WtTest::new();
-    let mut wt_session = wt.create_wt_session();
-    do_datagram_test(&mut wt, &mut wt_session);
+    let wt_session = wt.create_wt_session();
+    do_datagram_test(&mut wt, &wt_session);
 }
 
 #[test]
@@ -78,7 +80,7 @@ fn datagrams_server_only() {
         Http3Parameters::default().webtransport(true),
         wt_default_parameters(),
     );
-    let mut wt_session = wt.create_wt_session();
+    let wt_session = wt.create_wt_session();
 
     assert_eq!(
         wt_session.max_datagram_size(),
@@ -107,7 +109,7 @@ fn datagrams_client_only() {
         wt_default_parameters(),
         Http3Parameters::default().webtransport(true),
     );
-    let mut wt_session = wt.create_wt_session();
+    let wt_session = wt.create_wt_session();
 
     assert_eq!(
         wt_session.max_datagram_size(),
@@ -134,9 +136,9 @@ fn datagrams_client_only() {
 fn datagrams_multiple_session() {
     let mut wt = WtTest::new();
 
-    let mut wt_session1 = wt.create_wt_session();
-    do_datagram_test(&mut wt, &mut wt_session1);
+    let wt_session1 = wt.create_wt_session();
+    do_datagram_test(&mut wt, &wt_session1);
 
-    let mut wt_session_2 = wt.create_wt_session();
-    do_datagram_test(&mut wt, &mut wt_session_2);
+    let wt_session_2 = wt.create_wt_session();
+    do_datagram_test(&mut wt, &wt_session_2);
 }

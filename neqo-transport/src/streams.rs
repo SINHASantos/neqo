@@ -5,6 +5,10 @@
 // except according to those terms.
 
 // Stream management for a connection.
+use std::{cell::RefCell, cmp::Ordering, rc::Rc};
+
+use neqo_common::{qtrace, qwarn, Role};
+
 use crate::{
     fc::{LocalStreamLimits, ReceiverFlowControl, RemoteStreamLimits, SenderFlowControl},
     frame::Frame,
@@ -17,9 +21,6 @@ use crate::{
     tparams::{self, TransportParametersHandler},
     ConnectionEvents, Error, Res,
 };
-use neqo_common::{qtrace, qwarn, Role};
-use std::cmp::Ordering;
-use std::{cell::RefCell, rc::Rc};
 
 pub type SendOrder = i64;
 
@@ -94,6 +95,7 @@ impl Streams {
         }
     }
 
+    #[must_use]
     pub fn is_stream_id_allowed(&self, stream_id: StreamId) -> bool {
         self.remote_stream_limits[stream_id.stream_type()].is_allowed(stream_id)
     }
@@ -117,7 +119,9 @@ impl Streams {
         self.local_stream_limits = LocalStreamLimits::new(self.role);
     }
 
-    pub fn input_frame(&mut self, frame: Frame, stats: &mut FrameStats) -> Res<()> {
+    /// # Errors
+    /// When the frame is invalid.
+    pub fn input_frame(&mut self, frame: &Frame, stats: &mut FrameStats) -> Res<()> {
         match frame {
             Frame::ResetStream {
                 stream_id,
@@ -125,8 +129,8 @@ impl Streams {
                 final_size,
             } => {
                 stats.reset_stream += 1;
-                if let (_, Some(rs)) = self.obtain_stream(stream_id)? {
-                    rs.reset(application_error_code, final_size)?;
+                if let (_, Some(rs)) = self.obtain_stream(*stream_id)? {
+                    rs.reset(*application_error_code, *final_size)?;
                 }
             }
             Frame::StopSending {
@@ -135,9 +139,9 @@ impl Streams {
             } => {
                 stats.stop_sending += 1;
                 self.events
-                    .send_stream_stop_sending(stream_id, application_error_code);
-                if let (Some(ss), _) = self.obtain_stream(stream_id)? {
-                    ss.reset(application_error_code);
+                    .send_stream_stop_sending(*stream_id, *application_error_code);
+                if let (Some(ss), _) = self.obtain_stream(*stream_id)? {
+                    ss.reset(*application_error_code);
                 }
             }
             Frame::Stream {
@@ -148,13 +152,13 @@ impl Streams {
                 ..
             } => {
                 stats.stream += 1;
-                if let (_, Some(rs)) = self.obtain_stream(stream_id)? {
-                    rs.inbound_stream_frame(fin, offset, data)?;
+                if let (_, Some(rs)) = self.obtain_stream(*stream_id)? {
+                    rs.inbound_stream_frame(*fin, *offset, data)?;
                 }
             }
             Frame::MaxData { maximum_data } => {
                 stats.max_data += 1;
-                self.handle_max_data(maximum_data);
+                self.handle_max_data(*maximum_data);
             }
             Frame::MaxStreamData {
                 stream_id,
@@ -162,12 +166,12 @@ impl Streams {
             } => {
                 qtrace!(
                     "Stream {} Received MaxStreamData {}",
-                    stream_id,
-                    maximum_stream_data
+                    *stream_id,
+                    *maximum_stream_data
                 );
                 stats.max_stream_data += 1;
-                if let (Some(ss), _) = self.obtain_stream(stream_id)? {
-                    ss.set_max_stream_data(maximum_stream_data);
+                if let (Some(ss), _) = self.obtain_stream(*stream_id)? {
+                    ss.set_max_stream_data(*maximum_stream_data);
                 }
             }
             Frame::MaxStreams {
@@ -175,11 +179,11 @@ impl Streams {
                 maximum_streams,
             } => {
                 stats.max_streams += 1;
-                self.handle_max_streams(stream_type, maximum_streams);
+                self.handle_max_streams(*stream_type, *maximum_streams);
             }
             Frame::DataBlocked { data_limit } => {
                 // Should never happen since we set data limit to max
-                qwarn!("Received DataBlocked with data limit {}", data_limit);
+                qwarn!("Received DataBlocked with data limit {data_limit}");
                 stats.data_blocked += 1;
                 self.handle_data_blocked();
             }
@@ -192,16 +196,16 @@ impl Streams {
                     return Err(Error::StreamStateError);
                 }
 
-                if let (_, Some(rs)) = self.obtain_stream(stream_id)? {
+                if let (_, Some(rs)) = self.obtain_stream(*stream_id)? {
                     rs.send_flowc_update();
                 }
             }
             Frame::StreamsBlocked { .. } => {
                 stats.streams_blocked += 1;
-                // We send an update evry time we retire a stream. There is no need to
+                // We send an update every time we retire a stream. There is no need to
                 // trigger flow updates here.
             }
-            _ => unreachable!("This is not a stream Frame"),
+            _ => return Err(Error::InternalError), // This is not a stream frame.
         }
         Ok(())
     }
@@ -269,7 +273,7 @@ impl Streams {
             StreamRecoveryToken::Stream(st) => self.send.lost(st),
             StreamRecoveryToken::ResetStream { stream_id } => self.send.reset_lost(*stream_id),
             StreamRecoveryToken::StreamDataBlocked { stream_id, limit } => {
-                self.send.blocked_lost(*stream_id, *limit)
+                self.send.blocked_lost(*stream_id, *limit);
             }
             StreamRecoveryToken::MaxStreamData {
                 stream_id,
@@ -294,10 +298,10 @@ impl Streams {
                 self.remote_stream_limits[*stream_type].frame_lost(*max_streams);
             }
             StreamRecoveryToken::DataBlocked(limit) => {
-                self.sender_fc.borrow_mut().frame_lost(*limit)
+                self.sender_fc.borrow_mut().frame_lost(*limit);
             }
             StreamRecoveryToken::MaxData(maximum_data) => {
-                self.receiver_fc.borrow_mut().frame_lost(*maximum_data)
+                self.receiver_fc.borrow_mut().frame_lost(*maximum_data);
             }
         }
     }
@@ -330,11 +334,10 @@ impl Streams {
         // filter the list, removing closed streams
         self.send.remove_terminal();
 
-        let send = &self.send;
-        let (removed_bidi, removed_uni) = self.recv.clear_terminal(send, self.role);
+        let (removed_bidi, removed_uni) = self.recv.clear_terminal(&self.send, self.role);
 
         // Send max_streams updates if we removed remote-initiated recv streams.
-        // The updates will be send if any steams has been removed.
+        // The updates will be send if any streams has been removed.
         self.remote_stream_limits[StreamType::BiDi].add_retired(removed_bidi);
         self.remote_stream_limits[StreamType::UniDi].add_retired(removed_uni);
     }
@@ -400,25 +403,45 @@ impl Streams {
 
     /// Get or make a stream, and implicitly open additional streams as
     /// indicated by its stream id.
+    /// # Errors
+    /// When the stream cannot be created due to stream limits.
+    /// When the stream is locally-initiated and has not existed.
     pub fn obtain_stream(
         &mut self,
         stream_id: StreamId,
     ) -> Res<(Option<&mut SendStream>, Option<&mut RecvStream>)> {
         self.ensure_created_if_remote(stream_id)?;
-        Ok((
-            self.send.get_mut(stream_id).ok(),
-            self.recv.get_mut(stream_id).ok(),
-        ))
+        let ss = self.send.get_mut(stream_id).ok();
+        let rs = self.recv.get_mut(stream_id).ok();
+        // If it is:
+        // - neither a known send nor receive stream,
+        // - and it must be locally initiated,
+        // - and its index is larger than the local used stream limit,
+        // then it is an illegal stream.
+        if ss.is_none()
+            && rs.is_none()
+            && !stream_id.is_remote_initiated(self.role)
+            && self.local_stream_limits[stream_id.stream_type()].used() <= stream_id.index()
+        {
+            return Err(Error::StreamStateError);
+        }
+        Ok((ss, rs))
     }
 
+    /// # Errors
+    /// When the stream does not exist.
     pub fn set_sendorder(&mut self, stream_id: StreamId, sendorder: Option<SendOrder>) -> Res<()> {
         self.send.set_sendorder(stream_id, sendorder)
     }
 
+    /// # Errors
+    /// When the stream does not exist.
     pub fn set_fairness(&mut self, stream_id: StreamId, fairness: bool) -> Res<()> {
         self.send.set_fairness(stream_id, fairness)
     }
 
+    /// # Errors
+    /// When a stream cannot be created, which might be temporary.
     pub fn stream_create(&mut self, st: StreamType) -> Res<StreamId> {
         match self.local_stream_limits.take_stream_id(st) {
             None => Err(Error::StreamLimitError),
@@ -438,9 +461,10 @@ impl Streams {
 
                 if st == StreamType::BiDi {
                     // From the local perspective, this is a local- originated BiDi stream. From the
-                    // remote perspective, this is a remote-originated BiDi stream. Therefore, look at
-                    // the local transport parameters for the INITIAL_MAX_STREAM_DATA_BIDI_LOCAL value
-                    // to decide how much this endpoint will allow its peer to send.
+                    // remote perspective, this is a remote-originated BiDi stream. Therefore, look
+                    // at the local transport parameters for the
+                    // INITIAL_MAX_STREAM_DATA_BIDI_LOCAL value to decide how
+                    // much this endpoint will allow its peer to send.
                     let recv_initial_max_stream_data = self
                         .tps
                         .borrow()
@@ -463,21 +487,17 @@ impl Streams {
     }
 
     pub fn handle_max_data(&mut self, maximum_data: u64) {
-        let conn_was_blocked = self.sender_fc.borrow().available() == 0;
-        let conn_credit_increased = self.sender_fc.borrow_mut().update(maximum_data);
+        let previous_limit = self.sender_fc.borrow().available();
+        let Some(current_limit) = self.sender_fc.borrow_mut().update(maximum_data) else {
+            return;
+        };
 
-        if conn_was_blocked && conn_credit_increased {
-            for (id, ss) in &mut self.send {
-                if ss.avail() > 0 {
-                    // These may not actually all be writable if one
-                    // uses up all the conn credit. Not our fault.
-                    self.events.send_stream_writable(*id);
-                }
-            }
+        for (_id, ss) in &mut self.send {
+            ss.maybe_emit_writable_event(previous_limit, current_limit);
         }
     }
 
-    pub fn handle_data_blocked(&mut self) {
+    pub fn handle_data_blocked(&self) {
         self.receiver_fc.borrow_mut().send_flowc_update();
     }
 
@@ -518,28 +538,40 @@ impl Streams {
     }
 
     pub fn handle_max_streams(&mut self, stream_type: StreamType, maximum_streams: u64) {
-        if self.local_stream_limits[stream_type].update(maximum_streams) {
+        let increased = self.local_stream_limits[stream_type]
+            .update(maximum_streams)
+            .is_some();
+        if increased {
             self.events.send_stream_creatable(stream_type);
         }
     }
 
+    /// # Errors
+    /// When the stream does not exist.
     pub fn get_send_stream_mut(&mut self, stream_id: StreamId) -> Res<&mut SendStream> {
         self.send.get_mut(stream_id)
     }
 
+    /// # Errors
+    /// When the stream does not exist.
     pub fn get_send_stream(&self, stream_id: StreamId) -> Res<&SendStream> {
         self.send.get(stream_id)
     }
 
+    /// # Errors
+    /// When the stream does not exist.
     pub fn get_recv_stream_mut(&mut self, stream_id: StreamId) -> Res<&mut RecvStream> {
         self.recv.get_mut(stream_id)
     }
 
+    /// # Errors
+    /// When the stream does not exist.
     pub fn keep_alive(&mut self, stream_id: StreamId, keep: bool) -> Res<()> {
         self.recv.keep_alive(stream_id, keep)
     }
 
-    pub fn need_keep_alive(&mut self) -> bool {
+    #[must_use]
+    pub fn need_keep_alive(&self) -> bool {
         self.recv.need_keep_alive()
     }
 }

@@ -4,20 +4,21 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use crate::{CloseType, Error, Http3StreamType, ReceiveOutput, RecvStream, Res, Stream};
+use std::{cell::RefCell, rc::Rc};
+
 use neqo_qpack::QPackEncoder;
 use neqo_transport::{Connection, StreamId};
-use std::cell::RefCell;
-use std::rc::Rc;
+
+use crate::{CloseType, Error, Http3StreamType, ReceiveOutput, RecvStream, Res, Stream};
 
 #[derive(Debug)]
-pub(crate) struct EncoderRecvStream {
+pub struct EncoderRecvStream {
     stream_id: StreamId,
     encoder: Rc<RefCell<QPackEncoder>>,
 }
 
 impl EncoderRecvStream {
-    pub fn new(stream_id: StreamId, encoder: Rc<RefCell<QPackEncoder>>) -> Self {
+    pub const fn new(stream_id: StreamId, encoder: Rc<RefCell<QPackEncoder>>) -> Self {
         Self { stream_id, encoder }
     }
 }

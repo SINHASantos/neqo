@@ -4,31 +4,27 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use crate::frames::{FrameReader, HFrame, StreamReaderConnectionWrapper, H3_FRAME_TYPE_HEADERS};
-use crate::push_controller::PushController;
-use crate::{
-    headers_checks::{headers_valid, is_interim},
-    priority::PriorityHandler,
-    qlog, CloseType, Error, Http3StreamInfo, Http3StreamType, HttpRecvStream, HttpRecvStreamEvents,
-    MessageType, Priority, ReceiveOutput, RecvStream, Res, Stream,
-};
-use neqo_common::{qdebug, qinfo, qtrace, Header};
+use std::{cell::RefCell, cmp::min, collections::VecDeque, fmt::Debug, rc::Rc};
+
+use neqo_common::{header::HeadersExt as _, qdebug, qinfo, qtrace, Header};
 use neqo_qpack::decoder::QPackDecoder;
 use neqo_transport::{Connection, StreamId};
-use std::any::Any;
-use std::cell::RefCell;
-use std::cmp::min;
-use std::collections::VecDeque;
-use std::convert::TryFrom;
-use std::fmt::Debug;
-use std::rc::Rc;
+
+use crate::{
+    frames::{hframe::HFrameType, FrameReader, HFrame, StreamReaderConnectionWrapper},
+    headers_checks::{headers_valid, is_interim},
+    priority::PriorityHandler,
+    push_controller::PushController,
+    qlog, CloseType, Error, Http3StreamInfo, Http3StreamType, HttpRecvStream, HttpRecvStreamEvents,
+    MessageType, Priority, PushId, ReceiveOutput, RecvStream, Res, Stream,
+};
 
 #[allow(clippy::module_name_repetitions)]
-pub(crate) struct RecvMessageInfo {
+pub struct RecvMessageInfo {
     pub message_type: MessageType,
     pub stream_type: Http3StreamType,
     pub stream_id: StreamId,
-    pub header_frame_type_read: bool,
+    pub first_frame_type: Option<u64>,
 }
 
 /*
@@ -65,12 +61,12 @@ enum RecvMessageState {
 
 #[derive(Debug)]
 struct PushInfo {
-    push_id: u64,
+    push_id: PushId,
     header_block: Vec<u8>,
 }
 
 #[derive(Debug)]
-pub(crate) struct RecvMessage {
+pub struct RecvMessage {
     state: RecvMessageState,
     message_type: MessageType,
     stream_type: Http3StreamType,
@@ -98,11 +94,11 @@ impl RecvMessage {
     ) -> Self {
         Self {
             state: RecvMessageState::WaitingForResponseHeaders {
-                frame_reader: if message_info.header_frame_type_read {
-                    FrameReader::new_with_type(H3_FRAME_TYPE_HEADERS)
-                } else {
-                    FrameReader::new()
-                },
+                frame_reader: message_info
+                    .first_frame_type
+                    .map_or_else(FrameReader::new, |frame_type| {
+                        FrameReader::new_with_type(HFrameType(frame_type))
+                    }),
             },
             message_type: message_info.message_type,
             stream_type: message_info.stream_type,
@@ -130,7 +126,7 @@ impl RecvMessage {
             RecvMessageState::WaitingForFinAfterTrailers {..} => {
                 return Err(Error::HttpFrameUnexpected);
             }
-            _ => unreachable!("This functions is only called in WaitingForResponseHeaders | WaitingForData | WaitingForFinAfterTrailers state.")
+            _ => unreachable!("This functions is only called in WaitingForResponseHeaders | WaitingForData | WaitingForFinAfterTrailers state")
          }
         Ok(())
     }
@@ -150,13 +146,13 @@ impl RecvMessage {
                     };
                 }
             }
-            _ => unreachable!("This functions is only called in WaitingForResponseHeaders | WaitingForData | WaitingForFinAfterTrailers state.")
+            _ => unreachable!("This functions is only called in WaitingForResponseHeaders | WaitingForData | WaitingForFinAfterTrailers state")
         }
         Ok(())
     }
 
     fn add_headers(&mut self, mut headers: Vec<Header>, fin: bool) -> Res<()> {
-        qtrace!([self], "Add new headers fin={}", fin);
+        qtrace!("[{self}] Add new headers fin={fin}");
         let interim = match self.message_type {
             MessageType::Request => false,
             MessageType::Response => is_interim(&headers)?,
@@ -171,12 +167,8 @@ impl RecvMessage {
         }
 
         let is_web_transport = self.message_type == MessageType::Request
-            && headers
-                .iter()
-                .any(|h| h.name() == ":method" && h.value() == "CONNECT")
-            && headers
-                .iter()
-                .any(|h| h.name() == ":protocol" && h.value() == "webtransport");
+            && headers.contains_header(":method", "CONNECT")
+            && headers.contains_header(":protocol", "webtransport");
         if is_web_transport {
             self.conn_events
                 .extended_connect_new_session(self.stream_id, headers);
@@ -207,7 +199,10 @@ impl RecvMessage {
     fn set_state_to_close_pending(&mut self, post_readable_event: bool) -> Res<()> {
         // Stream has received fin. Depending on headers state set header_ready
         // or data_readable event so that app can pick up the fin.
-        qtrace!([self], "set_state_to_close_pending: state={:?}", self.state);
+        qtrace!(
+            "[{self}] set_state_to_close_pending: state={:?}",
+            self.state
+        );
 
         match self.state {
             RecvMessageState::WaitingForResponseHeaders { .. } => {
@@ -220,7 +215,7 @@ impl RecvMessage {
                     self.conn_events.data_readable(self.get_stream_info());
                 }
             }
-            _ => unreachable!("Closing an already closed transaction."),
+            _ => unreachable!("Closing an already closed transaction"),
         }
         if !matches!(self.state, RecvMessageState::Closed) {
             self.state = RecvMessageState::ClosePending;
@@ -228,7 +223,7 @@ impl RecvMessage {
         Ok(())
     }
 
-    fn handle_push_promise(&mut self, push_id: u64, header_block: Vec<u8>) -> Res<()> {
+    fn handle_push_promise(&mut self, push_id: PushId, header_block: Vec<u8>) -> Res<()> {
         if self.push_handler.is_none() {
             return Err(Error::HttpFrameUnexpected);
         }
@@ -258,9 +253,8 @@ impl RecvMessage {
     }
 
     fn receive_internal(&mut self, conn: &mut Connection, post_readable_event: bool) -> Res<()> {
-        let label = ::neqo_common::log_subject!(::log::Level::Debug, self);
         loop {
-            qdebug!([label], "state={:?}.", self.state);
+            qdebug!("[{self}] state={:?}", self.state);
             match &mut self.state {
                 // In the following 3 states we need to read frames.
                 RecvMessageState::WaitingForResponseHeaders { frame_reader }
@@ -275,12 +269,8 @@ impl RecvMessage {
                         }
                         (None, false) => break Ok(()),
                         (Some(frame), fin) => {
-                            qinfo!(
-                                [self],
-                                "A new frame has been received: {:?}; state={:?} fin={}",
-                                frame,
-                                self.state,
-                                fin,
+                            qdebug!(
+                                "[{self}] A new frame has been received: {frame:?}; state={:?} fin={fin}", self.state,
                             );
                             match frame {
                                 HFrame::Headers { header_block } => {
@@ -302,12 +292,9 @@ impl RecvMessage {
                                 break self.set_state_to_close_pending(post_readable_event);
                             }
                         }
-                    };
+                    }
                 }
-                RecvMessageState::DecodingHeaders {
-                    ref header_block,
-                    fin,
-                } => {
+                RecvMessageState::DecodingHeaders { header_block, fin } => {
                     if self
                         .qpack_decoder
                         .borrow()
@@ -315,8 +302,7 @@ impl RecvMessage {
                         && !self.blocked_push_promise.is_empty()
                     {
                         qinfo!(
-                            [self],
-                            "decoding header is blocked waiting for a push_promise header block."
+                            "[{self}] decoding header is blocked waiting for a push_promise header block"
                         );
                         break Ok(());
                     }
@@ -334,7 +320,7 @@ impl RecvMessage {
                             break Ok(());
                         }
                     } else {
-                        qinfo!([self], "decoding header is blocked.");
+                        qinfo!("[{self}] decoding header is blocked");
                         break Ok(());
                     }
                 }
@@ -348,10 +334,11 @@ impl RecvMessage {
                     panic!("Stream readable after being closed!");
                 }
                 RecvMessageState::ExtendedConnect => {
-                    // Ignore read event, this request is waiting to be picked up by a new WebTransportSession
+                    // Ignore read event, this request is waiting to be picked up by a new
+                    // WebTransportSession
                     break Ok(());
                 }
-            };
+            }
         }
     }
 
@@ -366,14 +353,14 @@ impl RecvMessage {
             .recv_closed(self.get_stream_info(), CloseType::Done);
     }
 
-    fn closing(&self) -> bool {
+    const fn closing(&self) -> bool {
         matches!(
             self.state,
             RecvMessageState::ClosePending | RecvMessageState::Closed
         )
     }
 
-    fn get_stream_info(&self) -> Http3StreamInfo {
+    const fn get_stream_info(&self) -> Http3StreamInfo {
         Http3StreamInfo::new(self.stream_id, Http3StreamType::Http)
     }
 }
@@ -473,16 +460,17 @@ impl HttpRecvStream for RecvMessage {
         self.receive(conn)
     }
 
-    fn maybe_update_priority(&mut self, priority: Priority) -> bool {
-        self.priority_handler.maybe_update_priority(priority)
+    fn maybe_update_priority(&mut self, priority: Priority) -> Res<bool> {
+        Ok(self.priority_handler.maybe_update_priority(priority))
     }
 
     fn priority_update_frame(&mut self) -> Option<HFrame> {
         self.priority_handler.maybe_encode_frame(self.stream_id)
     }
 
-    fn priority_update_sent(&mut self) {
+    fn priority_update_sent(&mut self) -> Res<()> {
         self.priority_handler.priority_update_sent();
+        Ok(())
     }
 
     fn set_new_listener(&mut self, conn_events: Box<dyn HttpRecvStreamEvents>) {
@@ -494,9 +482,5 @@ impl HttpRecvStream for RecvMessage {
 
     fn extended_connect_wait_for_response(&self) -> bool {
         matches!(self.state, RecvMessageState::ExtendedConnect)
-    }
-
-    fn any(&self) -> &dyn Any {
-        self
     }
 }

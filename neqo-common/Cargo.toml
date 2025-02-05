@@ -1,22 +1,49 @@
 [package]
 name = "neqo-common"
-version = "0.6.8"
-authors = ["Bobby Holley <bobbyholley@gmail.com>"]
-edition = "2018"
-rust-version = "1.65.0"
-license = "MIT OR Apache-2.0"
-build = "build.rs"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
-log = {version = "0.4.0", default-features = false}
-env_logger = {version = "0.10", default-features = false}
-lazy_static = "1.3.0"
-qlog = "0.9.0"
-time = {version = "=0.3.23", features = ["formatting"]}
+# Checked against https://searchfox.org/mozilla-central/source/Cargo.lock 2024-11-11
+enum-map = { workspace = true }
+env_logger = { version = "0.10", default-features = false }
+hex = { version = "0.4", default-features = false, features = ["alloc"], optional = true }
+log = { workspace = true }
+qlog = { workspace = true }
+
+[target."cfg(windows)".dependencies]
+# Checked against https://searchfox.org/mozilla-central/source/Cargo.lock 2024-11-11
+windows = { version = "0.58", default-features = false, features = ["Win32_Media"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+neqo-crypto = { path = "../neqo-crypto" }
+test-fixture = { path = "../test-fixture" }
+regex = { workspace = true }
 
 [features]
-deny-warnings = []
+bench = ["neqo-crypto/bench", "test-fixture/bench"]
+build-fuzzing-corpus = ["hex"]
+ci = []
+test-fixture = []
 
-[target."cfg(windows)".dependencies.winapi]
-version = "0.3"
-features = ["timeapi"]
+[lib]
+# See https://github.com/bheisler/criterion.rs/blob/master/book/src/faq.md#cargo-bench-gives-unrecognized-option-errors-for-valid-command-line-options
+bench = false
+
+[[bench]]
+name = "decoder"
+harness = false
+required-features = ["bench"]

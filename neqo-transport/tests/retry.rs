@@ -4,24 +4,30 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-#![cfg_attr(feature = "deny-warnings", deny(warnings))]
-#![warn(clippy::pedantic)]
-#![cfg(not(feature = "fuzzing"))]
+#![cfg(not(feature = "disable-encryption"))]
 
 mod common;
 
-use common::{
-    apply_header_protection, connected_server, decode_initial_header, default_server,
-    generate_ticket, initial_aead_and_hp, remove_header_protection,
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::Duration,
 };
+
+use common::{connected_server, default_server, generate_ticket};
 use neqo_common::{hex_with_len, qdebug, qtrace, Datagram, Encoder, Role};
 use neqo_crypto::AuthenticationStatus;
-use neqo_transport::{server::ValidateAddress, ConnectionError, Error, State, StreamType};
-use std::convert::TryFrom;
-use std::mem;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
-use test_fixture::{self, addr, assertions, default_client, now, split_datagram};
+use neqo_transport::{
+    server::ValidateAddress, CloseReason, ConnectionParameters, Error, State, StreamType,
+    MIN_INITIAL_PACKET_SIZE,
+};
+use test_fixture::{
+    assertions, datagram, default_client,
+    header_protection::{
+        apply_header_protection, decode_initial_header, initial_aead_and_hp,
+        remove_header_protection,
+    },
+    now, split_datagram,
+};
 
 #[test]
 fn retry_basic() {
@@ -29,25 +35,29 @@ fn retry_basic() {
     server.set_validation(ValidateAddress::Always);
     let mut client = default_client();
 
-    let dgram = client.process(None, now()).dgram(); // Initial
-    assert!(dgram.is_some());
-    let dgram = server.process(dgram, now()).dgram(); // Retry
-    assert!(dgram.is_some());
+    let dgram = client.process_output(now()).dgram(); // Initial
+    let dgram2 = client.process_output(now()).dgram(); // Initial
+    assert!(dgram.is_some() && dgram2.is_some());
+    _ = server.process(dgram, now()).dgram().unwrap(); // Retry
+    let dgram = server.process(dgram2, now()).dgram().unwrap(); // Retry
+    assertions::assert_retry(&dgram);
 
-    assertions::assert_retry(dgram.as_ref().unwrap());
-
-    let dgram = client.process(dgram, now()).dgram(); // Initial w/token
-    assert!(dgram.is_some());
+    let dgram = client.process(Some(dgram), now()).dgram(); // Initial w/token
+    let dgram2 = client.process_output(now()).dgram(); // Initial
+    assert!(dgram.is_some() && dgram2.is_some());
+    _ = server.process(dgram, now()).dgram().unwrap();
+    let dgram = server.process(dgram2, now()).dgram();
+    let dgram = client.process(dgram, now()).dgram();
     let dgram = server.process(dgram, now()).dgram(); // Initial, HS
     assert!(dgram.is_some());
-    mem::drop(client.process(dgram, now()).dgram()); // Ingest, drop any ACK.
+    drop(client.process(dgram, now()).dgram()); // Ingest, drop any ACK.
     client.authenticated(AuthenticationStatus::Ok, now());
-    let dgram = client.process(None, now()).dgram(); // Send Finished
+    let dgram = client.process_output(now()).dgram(); // Send Finished
     assert!(dgram.is_some());
     assert_eq!(*client.state(), State::Connected);
     let dgram = server.process(dgram, now()).dgram(); // (done)
     assert!(dgram.is_some()); // Note that this packet will be dropped...
-    connected_server(&mut server);
+    connected_server(&server);
 }
 
 /// Receiving a Retry is enough to infer something about the RTT.
@@ -60,7 +70,7 @@ fn implicit_rtt_retry() {
     let mut client = default_client();
     let mut now = now();
 
-    let dgram = client.process(None, now).dgram();
+    let dgram = client.process_output(now).dgram();
     now += RTT / 2;
     let dgram = server.process(dgram, now).dgram();
     assertions::assert_retry(dgram.as_ref().unwrap());
@@ -77,7 +87,7 @@ fn retry_expired() {
     let mut client = default_client();
     let mut now = now();
 
-    let dgram = client.process(None, now).dgram(); // Initial
+    let dgram = client.process_output(now).dgram(); // Initial
     assert!(dgram.is_some());
     let dgram = server.process(dgram, now).dgram(); // Retry
     assert!(dgram.is_some());
@@ -105,20 +115,26 @@ fn retry_0rtt() {
     let client_stream = client.stream_create(StreamType::UniDi).unwrap();
     client.stream_send(client_stream, &[1, 2, 3]).unwrap();
 
-    let dgram = client.process(None, now()).dgram(); // Initial w/0-RTT
-    assert!(dgram.is_some());
-    assertions::assert_coalesced_0rtt(dgram.as_ref().unwrap());
-    let dgram = server.process(dgram, now()).dgram(); // Retry
+    let dgram = client.process_output(now()).dgram(); // Initial
+    let dgram2 = client.process_output(now()).dgram(); // Initial w/0-RTT
+    assert!(dgram.is_some() && dgram2.is_some());
+    assertions::assert_coalesced_0rtt(dgram2.as_ref().unwrap());
+    _ = server.process(dgram, now()).dgram(); // Retry
+    let dgram = server.process(dgram2, now()).dgram(); // Retry
     assert!(dgram.is_some());
     assertions::assert_retry(dgram.as_ref().unwrap());
 
     // After retry, there should be a token and still coalesced 0-RTT.
-    let dgram = client.process(dgram, now()).dgram();
-    assert!(dgram.is_some());
-    assertions::assert_coalesced_0rtt(dgram.as_ref().unwrap());
+    let dgram = client.process(dgram, now()).dgram(); // Initial
+    let dgram2 = client.process_output(now()).dgram(); // Initial w/0-RTT
+    assert!(dgram.is_some() && dgram2.is_some());
+    assertions::assert_coalesced_0rtt(dgram2.as_ref().unwrap());
 
-    let dgram = server.process(dgram, now()).dgram(); // Initial, HS
+    _ = server.process(dgram, now()).dgram(); // ACK
+    let dgram = server.process(dgram2, now()).dgram(); // Initial, HS
     assert!(dgram.is_some());
+    let dgram = client.process(dgram, now()).dgram();
+    let dgram = server.process(dgram, now()).dgram();
     let dgram = client.process(dgram, now()).dgram();
     // Note: the client doesn't need to authenticate the server here
     // as there is no certificate; authentication is based on the ticket.
@@ -126,7 +142,7 @@ fn retry_0rtt() {
     assert_eq!(*client.state(), State::Connected);
     let dgram = server.process(dgram, now()).dgram(); // (done)
     assert!(dgram.is_some());
-    connected_server(&mut server);
+    connected_server(&server);
     assert!(client.tls_info().unwrap().resumed());
 }
 
@@ -136,7 +152,7 @@ fn retry_different_ip() {
     server.set_validation(ValidateAddress::Always);
     let mut client = default_client();
 
-    let dgram = client.process(None, now()).dgram(); // Initial
+    let dgram = client.process_output(now()).dgram(); // Initial
     assert!(dgram.is_some());
     let dgram = server.process(dgram, now()).dgram(); // Retry
     assert!(dgram.is_some());
@@ -150,7 +166,7 @@ fn retry_different_ip() {
     let dgram = dgram.unwrap();
     let other_v4 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
     let other_addr = SocketAddr::new(other_v4, 443);
-    let from_other = Datagram::new(other_addr, dgram.destination(), &dgram[..]);
+    let from_other = Datagram::new(other_addr, dgram.destination(), dgram.tos(), &dgram[..]);
     let dgram = server.process(Some(from_other), now()).dgram();
     assert!(dgram.is_none());
 }
@@ -164,14 +180,14 @@ fn new_token_different_ip() {
     let mut client = default_client();
     client.enable_resumption(now(), &token).unwrap();
 
-    let dgram = client.process(None, now()).dgram(); // Initial
+    let dgram = client.process_output(now()).dgram(); // Initial
     assert!(dgram.is_some());
     assertions::assert_initial(dgram.as_ref().unwrap(), true);
 
     // Now rewrite the source address.
     let d = dgram.unwrap();
     let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), d.source().port());
-    let dgram = Some(Datagram::new(src, d.destination(), &d[..]));
+    let dgram = Some(Datagram::new(src, d.destination(), d.tos(), &d[..]));
     let dgram = server.process(dgram, now()).dgram(); // Retry
     assert!(dgram.is_some());
     assertions::assert_retry(dgram.as_ref().unwrap());
@@ -186,7 +202,7 @@ fn new_token_expired() {
     let mut client = default_client();
     client.enable_resumption(now(), &token).unwrap();
 
-    let dgram = client.process(None, now()).dgram(); // Initial
+    let dgram = client.process_output(now()).dgram(); // Initial
     assert!(dgram.is_some());
     assertions::assert_initial(dgram.as_ref().unwrap(), true);
 
@@ -196,7 +212,7 @@ fn new_token_expired() {
     let the_future = now() + Duration::from_secs(60 * 60 * 24 * 30);
     let d = dgram.unwrap();
     let src = SocketAddr::new(d.source().ip(), d.source().port() + 1);
-    let dgram = Some(Datagram::new(src, d.destination(), &d[..]));
+    let dgram = Some(Datagram::new(src, d.destination(), d.tos(), &d[..]));
     let dgram = server.process(dgram, the_future).dgram(); // Retry
     assert!(dgram.is_some());
     assertions::assert_retry(dgram.as_ref().unwrap());
@@ -209,10 +225,15 @@ fn retry_after_initial() {
     retry_server.set_validation(ValidateAddress::Always);
     let mut client = default_client();
 
-    let cinit = client.process(None, now()).dgram(); // Initial
-    assert!(cinit.is_some());
-    let server_flight = server.process(cinit.clone(), now()).dgram(); // Initial
+    let cinit = client.process_output(now()).dgram(); // Initial
+    let cinit2 = client.process_output(now()).dgram(); // Initial
+    assert!(cinit.is_some() && cinit2.is_some());
+    _ = server.process(cinit.clone(), now()).dgram(); // Initial
+    let server_flight = server.process(cinit2, now()).dgram(); // Initial
     assert!(server_flight.is_some());
+
+    let dgram = client.process(server_flight, now()).dgram();
+    let server_flight = server.process(dgram, now()).dgram();
 
     // We need to have the client just process the Initial.
     let (server_initial, _other) = split_datagram(server_flight.as_ref().unwrap());
@@ -232,13 +253,14 @@ fn retry_after_initial() {
     let dgram = client.process(server_flight, now()).dgram();
     assert!(dgram.is_some()); // Drop this one.
     assert!(test_fixture::maybe_authenticate(&mut client));
-    let dgram = client.process(None, now()).dgram();
+    let dgram = server.process(dgram, now()).dgram();
+    let dgram = client.process(dgram, now()).dgram();
     assert!(dgram.is_some());
 
     assert_eq!(*client.state(), State::Connected);
     let dgram = server.process(dgram, now()).dgram(); // (done)
     assert!(dgram.is_some());
-    connected_server(&mut server);
+    connected_server(&server);
 }
 
 #[test]
@@ -247,9 +269,11 @@ fn retry_bad_integrity() {
     server.set_validation(ValidateAddress::Always);
     let mut client = default_client();
 
-    let dgram = client.process(None, now()).dgram(); // Initial
-    assert!(dgram.is_some());
-    let dgram = server.process(dgram, now()).dgram(); // Retry
+    let dgram = client.process_output(now()).dgram(); // Initial
+    let dgram2 = client.process_output(now()).dgram(); // Initial
+    assert!(dgram.is_some() && dgram2.is_some());
+    _ = server.process(dgram, now()).dgram(); // Retry
+    let dgram = server.process(dgram2, now()).dgram(); // Retry
     assert!(dgram.is_some());
 
     let retry = &dgram.as_ref().unwrap();
@@ -257,7 +281,7 @@ fn retry_bad_integrity() {
 
     let mut tweaked = retry.to_vec();
     tweaked[retry.len() - 1] ^= 0x45; // damage the auth tag
-    let tweaked_packet = Datagram::new(retry.source(), retry.destination(), tweaked);
+    let tweaked_packet = Datagram::new(retry.source(), retry.destination(), retry.tos(), tweaked);
 
     // The client should ignore this packet.
     let dgram = client.process(Some(tweaked_packet), now()).dgram();
@@ -272,7 +296,7 @@ fn retry_bad_token() {
     let mut server = default_server();
 
     // Send a retry to one server, then replay it to the other.
-    let client_initial1 = client.process(None, now()).dgram();
+    let client_initial1 = client.process_output(now()).dgram();
     assert!(client_initial1.is_some());
     let retry = retry_server.process(client_initial1, now()).dgram();
     assert!(retry.is_some());
@@ -295,23 +319,24 @@ fn retry_after_pto() {
     server.set_validation(ValidateAddress::Always);
     let mut now = now();
 
-    let ci = client.process(None, now).dgram();
-    assert!(ci.is_some()); // sit on this for a bit.RefCell
+    let ci = client.process_output(now).dgram();
+    let ci2 = client.process_output(now).dgram();
+    assert!(ci.is_some() && ci2.is_some()); // sit on this for a bit
 
     // Let PTO fire on the client and then let it exhaust its PTO packets.
     now += Duration::from_secs(1);
-    let pto1 = client.process(None, now).dgram();
-    assert!(pto1.unwrap().len() >= 1200);
-    let pto2 = client.process(None, now).dgram();
-    assert!(pto2.unwrap().len() >= 1200);
-    let cb = client.process(None, now).callback();
+    let pto = client.process_output(now).dgram();
+    assert!(pto.unwrap().len() >= MIN_INITIAL_PACKET_SIZE);
+    _ = client.process_output(now).dgram();
+    let cb = client.process_output(now).callback();
     assert_ne!(cb, Duration::new(0, 0));
 
-    let retry = server.process(ci, now).dgram();
+    _ = server.process(ci, now).dgram();
+    let retry = server.process(ci2, now).dgram();
     assertions::assert_retry(retry.as_ref().unwrap());
 
     let ci2 = client.process(retry, now).dgram();
-    assert!(ci2.unwrap().len() >= 1200);
+    assert!(ci2.unwrap().len() >= MIN_INITIAL_PACKET_SIZE);
 }
 
 #[test]
@@ -320,15 +345,19 @@ fn vn_after_retry() {
     server.set_validation(ValidateAddress::Always);
     let mut client = default_client();
 
-    let dgram = client.process(None, now()).dgram(); // Initial
-    assert!(dgram.is_some());
-    let dgram = server.process(dgram, now()).dgram(); // Retry
+    let dgram = client.process_output(now()).dgram(); // Initial
+    let dgram2 = client.process_output(now()).dgram(); // Initial
+    assert!(dgram.is_some() && dgram2.is_some());
+    _ = server.process(dgram, now()).dgram(); // Retry
+    let dgram = server.process(dgram2, now()).dgram(); // Retry
     assert!(dgram.is_some());
 
     assertions::assert_retry(dgram.as_ref().unwrap());
 
     let dgram = client.process(dgram, now()).dgram(); // Initial w/token
     assert!(dgram.is_some());
+    let dgram = server.process(dgram, now()).dgram();
+    _ = client.process(dgram, now()).dgram();
 
     let mut encoder = Encoder::default();
     encoder.encode_byte(0x80);
@@ -336,7 +365,7 @@ fn vn_after_retry() {
     encoder.encode_vec(1, &client.odcid().unwrap()[..]);
     encoder.encode_vec(1, &[]);
     encoder.encode_uint(4, 0x5a5a_6a6a_u64);
-    let vn = Datagram::new(addr(), addr(), encoder);
+    let vn = datagram(encoder.into());
 
     assert_ne!(
         client.process(Some(vn), now()).callback(),
@@ -355,15 +384,15 @@ fn vn_after_retry() {
 // at least 8 bytes long.  Otherwise, the second Initial won't have a
 // long enough connection ID.
 #[test]
-#[allow(clippy::shadow_unrelated)]
 fn mitm_retry() {
-    let mut client = default_client();
+    // This test decrypts packets and hence does not work with MLKEM enabled.
+    let mut client = test_fixture::new_client(ConnectionParameters::default().mlkem(false));
     let mut retry_server = default_server();
     retry_server.set_validation(ValidateAddress::Always);
     let mut server = default_server();
 
     // Trigger initial and a second client Initial.
-    let client_initial1 = client.process(None, now()).dgram();
+    let client_initial1 = client.process_output(now()).dgram();
     assert!(client_initial1.is_some());
     let retry = retry_server.process(client_initial1, now()).dgram();
     assert!(retry.is_some());
@@ -374,7 +403,7 @@ fn mitm_retry() {
     // rewriting the header to remove the token, and then re-encrypting.
     let client_initial2 = client_initial2.unwrap();
     let (protected_header, d_cid, s_cid, payload) =
-        decode_initial_header(&client_initial2, Role::Client);
+        decode_initial_header(&client_initial2, Role::Client).unwrap();
 
     // Now we have enough information to make keys.
     let (aead, hp) = initial_aead_and_hp(d_cid, Role::Client);
@@ -400,11 +429,11 @@ fn mitm_retry() {
     qtrace!("notoken_header={}", hex_with_len(&notoken_header));
 
     // Encrypt.
-    let mut notoken_packet = Encoder::with_capacity(1200)
+    let mut notoken_packet = Encoder::with_capacity(MIN_INITIAL_PACKET_SIZE)
         .encode(&notoken_header)
         .as_ref()
         .to_vec();
-    notoken_packet.resize_with(1200, u8::default);
+    notoken_packet.resize_with(MIN_INITIAL_PACKET_SIZE, u8::default);
     aead.encrypt(
         pn,
         &notoken_header,
@@ -413,7 +442,7 @@ fn mitm_retry() {
     )
     .unwrap();
     // Unlike with decryption, don't truncate.
-    // All 1200 bytes are needed to reach the minimum datagram size.
+    // All MIN_INITIAL_PACKET_SIZE bytes are needed to reach the minimum datagram size.
 
     apply_header_protection(&hp, &mut notoken_packet, pn_offset..(pn_offset + pn_len));
     qtrace!("packet={}", hex_with_len(&notoken_packet));
@@ -421,6 +450,7 @@ fn mitm_retry() {
     let new_datagram = Datagram::new(
         client_initial2.source(),
         client_initial2.destination(),
+        client_initial2.tos(),
         notoken_packet,
     );
     qdebug!("passing modified Initial to the main server");
@@ -437,7 +467,7 @@ fn mitm_retry() {
     assert!(matches!(
         *client.state(),
         State::Closing {
-            error: ConnectionError::Transport(Error::ProtocolViolation),
+            error: CloseReason::Transport(Error::ProtocolViolation),
             ..
         }
     ));

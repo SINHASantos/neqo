@@ -4,6 +4,12 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+#![allow(clippy::unwrap_used)] // Let's assume the use of `unwrap` was checked when the use of `unsafe` was reviewed.
+
+use std::{os::raw::c_void, pin::Pin};
+
+use neqo_common::qdebug;
+
 use crate::{
     agentio::as_c_void,
     constants::Epoch,
@@ -11,8 +17,6 @@ use crate::{
     p11::{PK11SymKey, PK11_ReferenceSymKey, SymKey},
     ssl::{PRFileDesc, SSLSecretCallback, SSLSecretDirection},
 };
-use neqo_common::qdebug;
-use std::{os::raw::c_void, pin::Pin};
 
 experimental_api!(SSL_SecretCallback(
     fd: *mut PRFileDesc,
@@ -38,7 +42,6 @@ impl From<SSLSecretDirection::Type> for SecretDirection {
 }
 
 #[derive(Debug, Default)]
-#[allow(clippy::module_name_repetitions)]
 pub struct DirectionalSecrets {
     // We only need to maintain 3 secrets for the epochs used during the handshake.
     secrets: [Option<SymKey>; 3],
@@ -68,7 +71,6 @@ pub struct Secrets {
 }
 
 impl Secrets {
-    #[allow(clippy::unused_self)]
     unsafe extern "C" fn secret_available(
         _fd: *mut PRFileDesc,
         epoch: u16,
@@ -87,7 +89,7 @@ impl Secrets {
     }
 
     fn put(&mut self, dir: SecretDirection, epoch: Epoch, key: SymKey) {
-        qdebug!("{:?} secret available for {:?}: {:?}", dir, epoch, key);
+        qdebug!("{dir:?} secret available for {epoch:?}: {key:?}");
         let keys = match dir {
             SecretDirection::Read => &mut self.r,
             SecretDirection::Write => &mut self.w,

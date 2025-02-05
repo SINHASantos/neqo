@@ -4,54 +4,136 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::net::SocketAddr;
-use std::ops::Deref;
+use std::{
+    net::SocketAddr,
+    ops::{Deref, DerefMut},
+};
 
-use crate::hex_with_len;
+use crate::{hex_with_len, IpTos};
 
-#[derive(PartialEq, Eq, Clone)]
-pub struct Datagram {
+#[derive(Clone, PartialEq, Eq)]
+pub struct Datagram<D = Vec<u8>> {
     src: SocketAddr,
     dst: SocketAddr,
-    d: Vec<u8>,
+    tos: IpTos,
+    d: D,
 }
 
-impl Datagram {
-    pub fn new<V: Into<Vec<u8>>>(src: SocketAddr, dst: SocketAddr, d: V) -> Self {
-        Self {
-            src,
-            dst,
-            d: d.into(),
-        }
-    }
-
+impl<D> Datagram<D> {
     #[must_use]
-    pub fn source(&self) -> SocketAddr {
+    pub const fn source(&self) -> SocketAddr {
         self.src
     }
 
     #[must_use]
-    pub fn destination(&self) -> SocketAddr {
+    pub const fn destination(&self) -> SocketAddr {
         self.dst
     }
-}
 
-impl Deref for Datagram {
-    type Target = Vec<u8>;
     #[must_use]
-    fn deref(&self) -> &Self::Target {
-        &self.d
+    pub const fn tos(&self) -> IpTos {
+        self.tos
+    }
+
+    pub fn set_tos(&mut self, tos: IpTos) {
+        self.tos = tos;
     }
 }
 
-impl std::fmt::Debug for Datagram {
+impl<D: AsRef<[u8]>> Datagram<D> {
+    pub fn len(&self) -> usize {
+        self.d.as_ref().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl<D: AsMut<[u8]> + AsRef<[u8]>> AsMut<[u8]> for Datagram<D> {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.d.as_mut()
+    }
+}
+
+impl Datagram<Vec<u8>> {
+    pub fn new<V: Into<Vec<u8>>>(src: SocketAddr, dst: SocketAddr, tos: IpTos, d: V) -> Self {
+        Self {
+            src,
+            dst,
+            tos,
+            d: d.into(),
+        }
+    }
+}
+
+impl<D: AsRef<[u8]> + AsMut<[u8]>> DerefMut for Datagram<D> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        AsMut::<[u8]>::as_mut(self)
+    }
+}
+
+impl<D: AsRef<[u8]>> Deref for Datagram<D> {
+    type Target = [u8];
+    #[must_use]
+    fn deref(&self) -> &Self::Target {
+        AsRef::<[u8]>::as_ref(self)
+    }
+}
+
+impl<D: AsRef<[u8]>> std::fmt::Debug for Datagram<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "Datagram {:?}->{:?}: {}",
+            "Datagram {:?} {:?}->{:?}: {}",
+            self.tos,
             self.src,
             self.dst,
             hex_with_len(&self.d)
         )
+    }
+}
+
+impl<'a> Datagram<&'a mut [u8]> {
+    #[must_use]
+    pub fn from_slice(src: SocketAddr, dst: SocketAddr, tos: IpTos, d: &'a mut [u8]) -> Self {
+        Self { src, dst, tos, d }
+    }
+
+    #[must_use]
+    pub fn to_owned(&self) -> Datagram {
+        Datagram {
+            src: self.src,
+            dst: self.dst,
+            tos: self.tos,
+            d: self.d.to_vec(),
+        }
+    }
+}
+
+impl<D: AsRef<[u8]>> AsRef<[u8]> for Datagram<D> {
+    fn as_ref(&self) -> &[u8] {
+        self.d.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use test_fixture::datagram;
+
+    #[test]
+    fn fmt_datagram() {
+        let d = datagram([0; 1].to_vec());
+        assert_eq!(
+            &format!("{d:?}"),
+            "Datagram IpTos(Cs0, Ect0) [fe80::1]:443->[fe80::1]:443: [1]: 00"
+        );
+    }
+
+    #[test]
+    fn is_empty() {
+        let d = datagram(vec![]);
+        assert_eq!(d.len(), 0);
+        assert!(d.is_empty());
     }
 }

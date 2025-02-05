@@ -4,6 +4,11 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use std::{
+    os::raw::{c_char, c_uint},
+    ptr::null_mut,
+};
+
 use crate::{
     constants::{
         Cipher, Version, TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384,
@@ -11,15 +16,10 @@ use crate::{
     },
     err::{Error, Res},
     p11::{
-        random, Item, PK11Origin, PK11SymKey, PK11_ImportDataKey, Slot, SymKey, CKA_DERIVE,
+        Item, PK11Origin, PK11SymKey, PK11_ImportDataKey, Slot, SymKey, CKA_DERIVE,
         CKM_HKDF_DERIVE, CK_ATTRIBUTE_TYPE, CK_MECHANISM_TYPE,
     },
-};
-
-use std::{
-    convert::TryFrom,
-    os::raw::{c_char, c_uint},
-    ptr::null_mut,
+    random,
 };
 
 experimental_api!(SSL_HkdfExtract(
@@ -40,28 +40,38 @@ experimental_api!(SSL_HkdfExpandLabel(
     secret: *mut *mut PK11SymKey,
 ));
 
-fn key_size(version: Version, cipher: Cipher) -> Res<usize> {
+const MAX_KEY_SIZE: usize = 48;
+const fn key_size(version: Version, cipher: Cipher) -> Res<usize> {
     if version != TLS_VERSION_1_3 {
         return Err(Error::UnsupportedVersion);
     }
-    Ok(match cipher {
+    let size = match cipher {
         TLS_AES_128_GCM_SHA256 | TLS_CHACHA20_POLY1305_SHA256 => 32,
         TLS_AES_256_GCM_SHA384 => 48,
         _ => return Err(Error::UnsupportedCipher),
-    })
+    };
+    debug_assert!(size <= MAX_KEY_SIZE);
+    Ok(size)
 }
 
 /// Generate a random key of the right size for the given suite.
 ///
 /// # Errors
-/// Only if NSS fails.
+///
+/// If the ciphersuite or protocol version is not supported.
 pub fn generate_key(version: Version, cipher: Cipher) -> Res<SymKey> {
-    import_key(version, &random(key_size(version, cipher)?))
+    // With generic_const_expr, this becomes:
+    //   import_key(version, &random::<{ key_size(version, cipher) }>())
+    import_key(
+        version,
+        &random::<MAX_KEY_SIZE>()[0..key_size(version, cipher)?],
+    )
 }
 
 /// Import a symmetric key for use with HKDF.
 ///
 /// # Errors
+///
 /// Errors returned if the key buffer is an incompatible size or the NSS functions fail.
 pub fn import_key(version: Version, buf: &[u8]) -> Res<SymKey> {
     if version != TLS_VERSION_1_3 {
@@ -74,7 +84,7 @@ pub fn import_key(version: Version, buf: &[u8]) -> Res<SymKey> {
             CK_MECHANISM_TYPE::from(CKM_HKDF_DERIVE),
             PK11Origin::PK11_OriginUnwrap,
             CK_ATTRIBUTE_TYPE::from(CKA_DERIVE),
-            &mut Item::wrap(buf),
+            &mut Item::wrap(buf)?,
             null_mut(),
         )
     };
@@ -84,6 +94,7 @@ pub fn import_key(version: Version, buf: &[u8]) -> Res<SymKey> {
 /// Extract a PRK from the given salt and IKM using the algorithm defined in RFC 5869.
 ///
 /// # Errors
+///
 /// Errors returned if inputs are too large or the NSS functions fail.
 pub fn extract(
     version: Version,
@@ -92,10 +103,7 @@ pub fn extract(
     ikm: &SymKey,
 ) -> Res<SymKey> {
     let mut prk: *mut PK11SymKey = null_mut();
-    let salt_ptr: *mut PK11SymKey = match salt {
-        Some(s) => **s,
-        None => null_mut(),
-    };
+    let salt_ptr: *mut PK11SymKey = salt.map_or(null_mut(), |s| **s);
     unsafe { SSL_HkdfExtract(version, cipher, salt_ptr, **ikm, &mut prk) }?;
     SymKey::from_ptr(prk)
 }
@@ -103,6 +111,7 @@ pub fn extract(
 /// Expand a PRK using the HKDF-Expand-Label function defined in RFC 8446.
 ///
 /// # Errors
+///
 /// Errors returned if inputs are too large or the NSS functions fail.
 pub fn expand_label(
     version: Version,

@@ -1,15 +1,24 @@
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+#![allow(clippy::unwrap_used)]
 #![allow(dead_code)]
+
+use std::{mem, time::Instant};
 
 use neqo_common::qinfo;
 use neqo_crypto::{
     AntiReplay, AuthenticationStatus, Client, HandshakeState, RecordList, Res, ResumptionToken,
     SecretAgent, Server, ZeroRttCheckResult, ZeroRttChecker,
 };
-use std::mem;
-use std::time::Instant;
 use test_fixture::{anti_replay, fixture_init, now};
 
 /// Consume records until the handshake state changes.
+#[allow(clippy::missing_panics_doc)]
+#[allow(clippy::missing_errors_doc)]
 pub fn forward_records(
     now: Instant,
     agent: &mut SecretAgent,
@@ -57,6 +66,7 @@ fn handshake(now: Instant, client: &mut SecretAgent, server: &mut SecretAgent) {
     }
 }
 
+#[allow(clippy::missing_panics_doc)]
 pub fn connect_at(now: Instant, client: &mut SecretAgent, server: &mut SecretAgent) {
     handshake(now, client, server);
     qinfo!("client: {:?}", client.state());
@@ -69,6 +79,7 @@ pub fn connect(client: &mut SecretAgent, server: &mut SecretAgent) {
     connect_at(now(), client, server);
 }
 
+#[allow(clippy::missing_panics_doc)]
 pub fn connect_fail(client: &mut SecretAgent, server: &mut SecretAgent) {
     handshake(now(), client, server);
     assert!(!client.state().is_connected());
@@ -105,12 +116,8 @@ impl ZeroRttChecker for PermissiveZeroRttChecker {
     }
 }
 
-fn zero_rtt_setup(
-    mode: Resumption,
-    client: &mut Client,
-    server: &mut Server,
-) -> Option<AntiReplay> {
-    if let Resumption::WithZeroRtt = mode {
+fn zero_rtt_setup(mode: Resumption, client: &Client, server: &mut Server) -> Option<AntiReplay> {
+    matches!(mode, Resumption::WithZeroRtt).then(|| {
         client.enable_0rtt().expect("should enable 0-RTT on client");
 
         let anti_replay = anti_replay();
@@ -121,18 +128,18 @@ fn zero_rtt_setup(
                 Box::new(PermissiveZeroRttChecker { resuming: false }),
             )
             .expect("should enable 0-RTT on server");
-        Some(anti_replay)
-    } else {
-        None
-    }
+        anti_replay
+    })
 }
 
+#[allow(clippy::missing_panics_doc)]
+#[must_use]
 pub fn resumption_setup(mode: Resumption) -> (Option<AntiReplay>, ResumptionToken) {
     fixture_init();
 
     let mut client = Client::new("server.example", true).expect("should create client");
     let mut server = Server::new(&["key"]).expect("should create server");
-    let anti_replay = zero_rtt_setup(mode, &mut client, &mut server);
+    let anti_replay = zero_rtt_setup(mode, &client, &mut server);
 
     connect(&mut client, &mut server);
 

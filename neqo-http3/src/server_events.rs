@@ -4,26 +4,28 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-#![allow(clippy::module_name_repetitions)]
-
-use crate::connection::{Http3State, WebTransportSessionAcceptAction};
-use crate::connection_server::Http3ServerHandler;
-use crate::{
-    features::extended_connect::SessionCloseReason, Http3StreamInfo, Http3StreamType, Priority, Res,
+use std::{
+    cell::RefCell,
+    collections::VecDeque,
+    ops::{Deref, DerefMut},
+    rc::Rc,
 };
-use neqo_common::{qdebug, qinfo, Encoder, Header};
-use neqo_transport::server::ActiveConnectionRef;
-use neqo_transport::{AppError, Connection, DatagramTracking, StreamId, StreamType};
 
-use std::cell::RefCell;
-use std::collections::VecDeque;
-use std::convert::TryFrom;
-use std::ops::{Deref, DerefMut};
-use std::rc::Rc;
+use neqo_common::{qdebug, Encoder, Header};
+use neqo_transport::{
+    server::ConnectionRef, AppError, Connection, DatagramTracking, StreamId, StreamType,
+};
+
+use crate::{
+    connection::{Http3State, WebTransportSessionAcceptAction},
+    connection_server::Http3ServerHandler,
+    features::extended_connect::SessionCloseReason,
+    Error, Http3StreamInfo, Http3StreamType, Priority, Res,
+};
 
 #[derive(Debug, Clone)]
 pub struct StreamHandler {
-    pub conn: ActiveConnectionRef,
+    pub conn: ConnectionRef,
     pub handler: Rc<RefCell<Http3ServerHandler>>,
     pub stream_info: Http3StreamInfo,
 }
@@ -31,7 +33,7 @@ pub struct StreamHandler {
 impl ::std::fmt::Display for StreamHandler {
     fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
         let conn: &Connection = &self.conn.borrow();
-        write!(f, "conn={} stream_info={:?}", conn, self.stream_info)
+        write!(f, "conn={conn} stream_info={:?}", self.stream_info)
     }
 }
 
@@ -39,7 +41,7 @@ impl std::hash::Hash for StreamHandler {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.conn.hash(state);
         state.write_u64(self.stream_info.stream_id().as_u64());
-        state.finish();
+        _ = state.finish();
     }
 }
 
@@ -52,14 +54,16 @@ impl PartialEq for StreamHandler {
 impl Eq for StreamHandler {}
 
 impl StreamHandler {
-    pub fn stream_id(&self) -> StreamId {
+    pub const fn stream_id(&self) -> StreamId {
         self.stream_info.stream_id()
     }
 
     /// Supply a response header to a request.
+    ///
     /// # Errors
+    ///
     /// It may return `InvalidStreamId` if a stream does not exist anymore.
-    pub fn send_headers(&mut self, headers: &[Header]) -> Res<()> {
+    pub fn send_headers(&self, headers: &[Header]) -> Res<()> {
         self.handler.borrow_mut().send_headers(
             self.stream_id(),
             headers,
@@ -68,32 +72,49 @@ impl StreamHandler {
     }
 
     /// Supply response data to a request.
+    ///
     /// # Errors
+    ///
     /// It may return `InvalidStreamId` if a stream does not exist anymore.
-    pub fn send_data(&mut self, buf: &[u8]) -> Res<usize> {
+    pub fn send_data(&self, buf: &[u8]) -> Res<usize> {
         self.handler
             .borrow_mut()
             .send_data(self.stream_id(), buf, &mut self.conn.borrow_mut())
     }
 
-    /// Close sending side.
+    /// Bytes sendable on stream at the QUIC layer.
+    ///
+    /// Note that this does not yet account for HTTP3 frame headers.
+    ///
     /// # Errors
+    ///
     /// It may return `InvalidStreamId` if a stream does not exist anymore.
-    pub fn stream_close_send(&mut self) -> Res<()> {
+    pub fn available(&self) -> Res<usize> {
+        let stream_id = self.stream_id();
+        let n = self.conn.borrow_mut().stream_avail_send_space(stream_id)?;
+        Ok(n)
+    }
+
+    /// Close sending side.
+    ///
+    /// # Errors
+    ///
+    /// It may return `InvalidStreamId` if a stream does not exist anymore.
+    pub fn stream_close_send(&self) -> Res<()> {
         self.handler
             .borrow_mut()
             .stream_close_send(self.stream_id(), &mut self.conn.borrow_mut())
     }
 
     /// Request a peer to stop sending a stream.
+    ///
     /// # Errors
+    ///
     /// It may return `InvalidStreamId` if a stream does not exist anymore.
-    pub fn stream_stop_sending(&mut self, app_error: AppError) -> Res<()> {
+    pub fn stream_stop_sending(&self, app_error: AppError) -> Res<()> {
         qdebug!(
-            [self],
-            "stop sending stream_id:{} error:{}.",
-            self.stream_info.stream_id(),
-            app_error
+            "[{self}] stop sending stream_id:{} error:{app_error}",
+            self.stream_info.stream_id()
         );
         self.handler.borrow_mut().stream_stop_sending(
             self.stream_info.stream_id(),
@@ -103,14 +124,14 @@ impl StreamHandler {
     }
 
     /// Reset sending side of a stream.
+    ///
     /// # Errors
+    ///
     /// It may return `InvalidStreamId` if a stream does not exist anymore.
-    pub fn stream_reset_send(&mut self, app_error: AppError) -> Res<()> {
+    pub fn stream_reset_send(&self, app_error: AppError) -> Res<()> {
         qdebug!(
-            [self],
-            "reset send stream_id:{} error:{}.",
-            self.stream_info.stream_id(),
-            app_error
+            "[{self}] reset send stream_id:{} error:{app_error}",
+            self.stream_info.stream_id()
         );
         self.handler.borrow_mut().stream_reset_send(
             self.stream_info.stream_id(),
@@ -120,10 +141,12 @@ impl StreamHandler {
     }
 
     /// Reset a stream/request.
+    ///
     /// # Errors
+    ///
     /// It may return `InvalidStreamId` if a stream does not exist anymore
-    pub fn cancel_fetch(&mut self, app_error: AppError) -> Res<()> {
-        qdebug!([self], "reset error:{}.", app_error);
+    pub fn cancel_fetch(&self, app_error: AppError) -> Res<()> {
+        qdebug!("[{self}] reset error:{app_error}");
         self.handler.borrow_mut().cancel_fetch(
             self.stream_info.stream_id(),
             app_error,
@@ -144,8 +167,8 @@ impl ::std::fmt::Display for Http3OrWebTransportStream {
 }
 
 impl Http3OrWebTransportStream {
-    pub(crate) fn new(
-        conn: ActiveConnectionRef,
+    pub(crate) const fn new(
+        conn: ConnectionRef,
         handler: Rc<RefCell<Http3ServerHandler>>,
         stream_info: Http3StreamInfo,
     ) -> Self {
@@ -159,25 +182,31 @@ impl Http3OrWebTransportStream {
     }
 
     /// Supply a response header to a request.
+    ///
     /// # Errors
+    ///
     /// It may return `InvalidStreamId` if a stream does not exist anymore.
-    pub fn send_headers(&mut self, headers: &[Header]) -> Res<()> {
+    pub fn send_headers(&self, headers: &[Header]) -> Res<()> {
         self.stream_handler.send_headers(headers)
     }
 
     /// Supply response data to a request.
+    ///
     /// # Errors
+    ///
     /// It may return `InvalidStreamId` if a stream does not exist anymore.
-    pub fn send_data(&mut self, data: &[u8]) -> Res<usize> {
-        qinfo!([self], "Set new response.");
+    pub fn send_data(&self, data: &[u8]) -> Res<usize> {
+        qdebug!("[{self}] Set new response");
         self.stream_handler.send_data(data)
     }
 
     /// Close sending side.
+    ///
     /// # Errors
+    ///
     /// It may return `InvalidStreamId` if a stream does not exist anymore.
-    pub fn stream_close_send(&mut self) -> Res<()> {
-        qinfo!([self], "Set new response.");
+    pub fn stream_close_send(&self) -> Res<()> {
+        qdebug!("[{self}] Set new response");
         self.stream_handler.stream_close_send()
     }
 }
@@ -199,7 +228,7 @@ impl DerefMut for Http3OrWebTransportStream {
 impl std::hash::Hash for Http3OrWebTransportStream {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.stream_handler.hash(state);
-        state.finish();
+        _ = state.finish();
     }
 }
 
@@ -223,8 +252,8 @@ impl ::std::fmt::Display for WebTransportRequest {
 }
 
 impl WebTransportRequest {
-    pub(crate) fn new(
-        conn: ActiveConnectionRef,
+    pub(crate) const fn new(
+        conn: ConnectionRef,
         handler: Rc<RefCell<Http3ServerHandler>>,
         stream_id: StreamId,
     ) -> Self {
@@ -243,10 +272,12 @@ impl WebTransportRequest {
     }
 
     /// Respond to a `WebTransport` session request.
+    ///
     /// # Errors
+    ///
     /// It may return `InvalidStreamId` if a stream does not exist anymore.
-    pub fn response(&mut self, accept: &WebTransportSessionAcceptAction) -> Res<()> {
-        qinfo!([self], "Set a response for a WebTransport session.");
+    pub fn response(&self, accept: &WebTransportSessionAcceptAction) -> Res<()> {
+        qdebug!("[{self}] Set a response for a WebTransport session");
         self.stream_handler
             .handler
             .borrow_mut()
@@ -258,10 +289,11 @@ impl WebTransportRequest {
     }
 
     /// # Errors
+    ///
     /// It may return `InvalidStreamId` if a stream does not exist anymore.
     /// Also return an error if the stream was closed on the transport layer,
     /// but that information is not yet consumed on the  http/3 layer.
-    pub fn close_session(&mut self, error: u32, message: &str) -> Res<()> {
+    pub fn close_session(&self, error: u32, message: &str) -> Res<()> {
         self.stream_handler
             .handler
             .borrow_mut()
@@ -274,14 +306,16 @@ impl WebTransportRequest {
     }
 
     #[must_use]
-    pub fn stream_id(&self) -> StreamId {
+    pub const fn stream_id(&self) -> StreamId {
         self.stream_handler.stream_id()
     }
 
     /// Close sending side.
+    ///
     /// # Errors
+    ///
     /// It may return `InvalidStreamId` if a stream does not exist anymore.
-    pub fn create_stream(&mut self, stream_type: StreamType) -> Res<Http3OrWebTransportStream> {
+    pub fn create_stream(&self, stream_type: StreamType) -> Res<Http3OrWebTransportStream> {
         let session_id = self.stream_handler.stream_id();
         let id = self
             .stream_handler
@@ -295,17 +329,19 @@ impl WebTransportRequest {
 
         Ok(Http3OrWebTransportStream::new(
             self.stream_handler.conn.clone(),
-            self.stream_handler.handler.clone(),
+            Rc::clone(&self.stream_handler.handler),
             Http3StreamInfo::new(id, Http3StreamType::WebTransport(session_id)),
         ))
     }
 
     /// Send `WebTransport` datagram.
+    ///
     /// # Errors
+    ///
     /// It may return `InvalidStreamId` if a stream does not exist anymore.
     /// The function returns `TooMuchData` if the supply buffer is bigger than
     /// the allowed remote datagram size.
-    pub fn send_datagram(&mut self, buf: &[u8], id: impl Into<DatagramTracking>) -> Res<()> {
+    pub fn send_datagram(&self, buf: &[u8], id: impl Into<DatagramTracking>) -> Res<()> {
         let session_id = self.stream_handler.stream_id();
         self.stream_handler
             .handler
@@ -326,9 +362,13 @@ impl WebTransportRequest {
     /// Returns the current max size of a datagram that can fit into a packet.
     /// The value will change over time depending on the encoded size of the
     /// packet number, ack frames, etc.
+    ///
     /// # Errors
+    ///
     /// The function returns `NotAvailable` if datagrams are not enabled.
+    ///
     /// # Panics
+    ///
     /// This cannot panic. The max varint length is 8.
     pub fn max_datagram_size(&self) -> Res<u64> {
         let max_size = self.stream_handler.conn.borrow().max_datagram_size()?;
@@ -336,7 +376,7 @@ impl WebTransportRequest {
             - u64::try_from(Encoder::varint_len(
                 self.stream_handler.stream_id().as_u64(),
             ))
-            .unwrap())
+            .map_err(|_| Error::Internal)?)
     }
 }
 
@@ -357,7 +397,7 @@ impl DerefMut for WebTransportRequest {
 impl std::hash::Hash for WebTransportRequest {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.stream_handler.hash(state);
-        state.finish();
+        _ = state.finish();
     }
 }
 
@@ -414,7 +454,7 @@ pub enum Http3ServerEvent {
     },
     /// When individual connection change state. It is only used for tests.
     StateChange {
-        conn: ActiveConnectionRef,
+        conn: ConnectionRef,
         state: Http3State,
     },
     PriorityUpdate {
@@ -425,6 +465,7 @@ pub enum Http3ServerEvent {
 }
 
 #[derive(Debug, Default, Clone)]
+#[allow(clippy::module_name_repetitions)]
 pub struct Http3ServerEvents {
     events: Rc<RefCell<VecDeque<Http3ServerEvent>>>,
 }
@@ -464,14 +505,14 @@ impl Http3ServerEvents {
     }
 
     /// Insert a `StateChange` event.
-    pub(crate) fn connection_state_change(&self, conn: ActiveConnectionRef, state: Http3State) {
+    pub(crate) fn connection_state_change(&self, conn: ConnectionRef, state: Http3State) {
         self.insert(Http3ServerEvent::StateChange { conn, state });
     }
 
     /// Insert a `Data` event.
     pub(crate) fn data(
         &self,
-        conn: ActiveConnectionRef,
+        conn: ConnectionRef,
         handler: Rc<RefCell<Http3ServerHandler>>,
         stream_info: Http3StreamInfo,
         data: Vec<u8>,
@@ -486,7 +527,7 @@ impl Http3ServerEvents {
 
     pub(crate) fn data_writable(
         &self,
-        conn: ActiveConnectionRef,
+        conn: ConnectionRef,
         handler: Rc<RefCell<Http3ServerHandler>>,
         stream_info: Http3StreamInfo,
     ) {
@@ -497,7 +538,7 @@ impl Http3ServerEvents {
 
     pub(crate) fn stream_reset(
         &self,
-        conn: ActiveConnectionRef,
+        conn: ConnectionRef,
         handler: Rc<RefCell<Http3ServerHandler>>,
         stream_info: Http3StreamInfo,
         error: AppError,
@@ -510,7 +551,7 @@ impl Http3ServerEvents {
 
     pub(crate) fn stream_stop_sending(
         &self,
-        conn: ActiveConnectionRef,
+        conn: ConnectionRef,
         handler: Rc<RefCell<Http3ServerHandler>>,
         stream_info: Http3StreamInfo,
         error: AppError,

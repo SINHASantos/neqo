@@ -1,23 +1,69 @@
 [package]
 name = "neqo-transport"
-version = "0.6.8"
-authors = ["EKR <ekr@rtfm.com>", "Andy Grover <agrover@mozilla.com>"]
-edition = "2018"
-rust-version = "1.65.0"
-license = "MIT OR Apache-2.0"
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
-neqo-crypto = { path = "../neqo-crypto" }
+# Checked against https://searchfox.org/mozilla-central/source/Cargo.lock 2024-11-11
+enum-map = { workspace = true }
+indexmap = { version = "2.2", default-features = false } # See https://github.com/mozilla/neqo/issues/1858
+log = { workspace = true }
 neqo-common = { path = "../neqo-common" }
-lazy_static = "1.3.0"
-log = {version = "0.4.0", default-features = false}
-smallvec = "1.0.0"
-qlog = "0.9.0"
-indexmap = "1.0"
+neqo-crypto = { path = "../neqo-crypto" }
+mtu = { version = "0.2.3", default-features = false } # neqo is only user currently, can bump freely
+qlog = { workspace = true }
+smallvec = { version = "1.13", default-features = false }
+static_assertions = { workspace = true }
 
 [dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+neqo-transport = { path = ".", features = ["draft-29"] }
 test-fixture = { path = "../test-fixture" }
 
 [features]
-deny-warnings = []
-fuzzing = ["neqo-crypto/fuzzing"]
+bench = ["neqo-common/bench", "neqo-crypto/bench"]
+build-fuzzing-corpus = [
+        "neqo-common/build-fuzzing-corpus",
+        "neqo-crypto/disable-encryption",
+        "neqo-crypto/disable-random",
+        "test-fixture/disable-random",
+]
+disable-encryption = ["neqo-crypto/disable-encryption"]
+draft-29 = []
+gecko = ["mtu/gecko"]
+
+[lib]
+# See https://github.com/bheisler/criterion.rs/blob/master/book/src/faq.md#cargo-bench-gives-unrecognized-option-errors-for-valid-command-line-options
+bench = false
+
+[[bench]]
+name = "transfer"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "rx_stream_orderer"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "range_tracker"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "sent_packets"
+harness = false
+required-features = ["bench"]

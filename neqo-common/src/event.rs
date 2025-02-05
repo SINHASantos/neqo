@@ -4,7 +4,6 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::iter::Iterator;
 use std::marker::PhantomData;
 
 /// An event provider is able to generate a stream of events.
@@ -42,7 +41,7 @@ where
     }
 }
 
-impl<'a, P, E> Iterator for Iter<'a, P, E>
+impl<P, E> Iterator for Iter<'_, P, E>
 where
     P: Provider<Event = E>,
 {

@@ -4,21 +4,19 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-#![allow(clippy::module_name_repetitions)]
+use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
-use crate::connection::Http3State;
-use crate::settings::HSettingType;
-use crate::{
-    features::extended_connect::{ExtendedConnectEvents, ExtendedConnectType, SessionCloseReason},
-    CloseType, Http3StreamInfo, HttpRecvStreamEvents, RecvStreamEvents, SendStreamEvents,
-};
 use neqo_common::{event::Provider as EventProvider, Header};
 use neqo_crypto::ResumptionToken;
 use neqo_transport::{AppError, StreamId, StreamType};
 
-use std::cell::RefCell;
-use std::collections::VecDeque;
-use std::rc::Rc;
+use crate::{
+    connection::Http3State,
+    features::extended_connect::{ExtendedConnectEvents, ExtendedConnectType, SessionCloseReason},
+    settings::HSettingType,
+    CloseType, Error, Http3StreamInfo, HttpRecvStreamEvents, PushId, RecvStreamEvents, Res,
+    SendStreamEvents,
+};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum WebTransportEvent {
@@ -62,31 +60,31 @@ pub enum Http3ClientEvent {
         error: AppError,
         local: bool,
     },
-    /// Peer has sent a STOP_SENDING.
+    /// Peer has sent a `STOP_SENDING`.
     StopSending {
         stream_id: StreamId,
         error: AppError,
     },
     /// A new push promise.
     PushPromise {
-        push_id: u64,
+        push_id: PushId,
         request_stream_id: StreamId,
         headers: Vec<Header>,
     },
     /// A push response headers are ready.
     PushHeaderReady {
-        push_id: u64,
+        push_id: PushId,
         headers: Vec<Header>,
         interim: bool,
         fin: bool,
     },
     /// New bytes are available on a push stream for reading.
-    PushDataReadable { push_id: u64 },
+    PushDataReadable { push_id: PushId },
     /// A push has been canceled.
-    PushCanceled { push_id: u64 },
-    /// A push stream was been reset due to a HttpGeneralProtocol error.
+    PushCanceled { push_id: PushId },
+    /// A push stream was been reset due to a `HttpGeneralProtocol` error.
     /// Most common case are malformed response headers.
-    PushReset { push_id: u64, error: AppError },
+    PushReset { push_id: PushId, error: AppError },
     /// New stream can be created
     RequestsCreatable,
     /// Cert authentication needed
@@ -103,11 +101,12 @@ pub enum Http3ClientEvent {
     GoawayReceived,
     /// Connection state change.
     StateChange(Http3State),
-    /// WebTransport events
+    /// `WebTransport` events
     WebTransport(WebTransportEvent),
 }
 
 #[derive(Debug, Default, Clone)]
+#[allow(clippy::module_name_repetitions)]
 pub struct Http3ClientEvents {
     events: Rc<RefCell<VecDeque<Http3ClientEvent>>>,
 }
@@ -197,7 +196,7 @@ impl ExtendedConnectEvents for Http3ClientEvents {
                 headers,
             }));
         } else {
-            unreachable!("There is only ExtendedConnectType::WebTransport.");
+            unreachable!("There is only ExtendedConnectType::WebTransport");
         }
     }
 
@@ -217,17 +216,18 @@ impl ExtendedConnectEvents for Http3ClientEvents {
                 },
             ));
         } else {
-            unreachable!("There are no other types.");
+            unreachable!("There are no other types");
         }
     }
 
-    fn extended_connect_new_stream(&self, stream_info: Http3StreamInfo) {
+    fn extended_connect_new_stream(&self, stream_info: Http3StreamInfo) -> Res<()> {
         self.insert(Http3ClientEvent::WebTransport(
             WebTransportEvent::NewStream {
                 stream_id: stream_info.stream_id(),
-                session_id: stream_info.session_id().unwrap(),
+                session_id: stream_info.session_id().ok_or(Error::Internal)?,
             },
         ));
+        Ok(())
     }
 
     fn new_datagram(&self, session_id: StreamId, datagram: Vec<u8>) {
@@ -241,7 +241,7 @@ impl ExtendedConnectEvents for Http3ClientEvents {
 }
 
 impl Http3ClientEvents {
-    pub fn push_promise(&self, push_id: u64, request_stream_id: StreamId, headers: Vec<Header>) {
+    pub fn push_promise(&self, push_id: PushId, request_stream_id: StreamId, headers: Vec<Header>) {
         self.insert(Http3ClientEvent::PushPromise {
             push_id,
             request_stream_id,
@@ -249,12 +249,12 @@ impl Http3ClientEvents {
         });
     }
 
-    pub fn push_canceled(&self, push_id: u64) {
+    pub fn push_canceled(&self, push_id: PushId) {
         self.remove_events_for_push_id(push_id);
         self.insert(Http3ClientEvent::PushCanceled { push_id });
     }
 
-    pub fn push_reset(&self, push_id: u64, error: AppError) {
+    pub fn push_reset(&self, push_id: PushId, error: AppError) {
         self.remove_events_for_push_id(push_id);
         self.insert(Http3ClientEvent::PushReset { push_id, error });
     }
@@ -337,7 +337,7 @@ impl Http3ClientEvents {
         });
     }
 
-    pub fn has_push(&self, push_id: u64) -> bool {
+    pub fn has_push(&self, push_id: PushId) -> bool {
         for iter in &*self.events.borrow() {
             if matches!(iter, Http3ClientEvent::PushPromise{push_id:x, ..} if *x == push_id) {
                 return true;
@@ -346,7 +346,7 @@ impl Http3ClientEvents {
         false
     }
 
-    pub fn remove_events_for_push_id(&self, push_id: u64) {
+    pub fn remove_events_for_push_id(&self, push_id: PushId) {
         self.remove(|evt| {
             matches!(evt,
                 Http3ClientEvent::PushPromise{ push_id: x, .. }

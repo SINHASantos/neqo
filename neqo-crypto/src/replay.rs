@@ -4,22 +4,20 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use crate::{
-    err::Res,
-    ssl::PRFileDesc,
-    time::{Interval, PRTime, Time},
-};
 use std::{
-    convert::{TryFrom, TryInto},
     ops::{Deref, DerefMut},
     os::raw::c_uint,
     ptr::null_mut,
     time::{Duration, Instant},
 };
 
+use crate::{
+    err::Res,
+    ssl::PRFileDesc,
+    time::{Interval, PRTime, Time},
+};
+
 // This is an opaque struct in NSS.
-#[allow(clippy::upper_case_acronyms)]
-#[allow(clippy::empty_enum)]
 pub enum SSLAntiReplayContext {}
 
 experimental_api!(SSL_CreateAntiReplayContext(
@@ -42,10 +40,10 @@ scoped_ptr!(
 );
 
 /// `AntiReplay` is used by servers when processing 0-RTT handshakes.
+///
 /// It limits the exposure of servers to replay attack by rejecting 0-RTT
 /// if it appears to be a replay.  There is a false-positive rate that can be
 /// managed by tuning the parameters used to create the context.
-#[allow(clippy::module_name_repetitions)]
 pub struct AntiReplay {
     ctx: AntiReplayContext,
 }
@@ -55,6 +53,7 @@ impl AntiReplay {
     /// See the documentation in NSS for advice on how to set these values.
     ///
     /// # Errors
+    ///
     /// Returns an error if `now` is in the past relative to our baseline or
     /// NSS is unable to generate an anti-replay context.
     pub fn new(now: Instant, window: Duration, k: usize, bits: usize) -> Res<Self> {

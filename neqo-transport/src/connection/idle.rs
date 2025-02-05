@@ -4,12 +4,14 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use crate::recovery::RecoveryToken;
-use neqo_common::qtrace;
 use std::{
     cmp::{max, min},
     time::{Duration, Instant},
 };
+
+use neqo_common::qtrace;
+
+use crate::recovery::RecoveryToken;
 
 #[derive(Debug, Clone)]
 /// There's a little bit of different behavior for resetting idle timeout. See
@@ -30,37 +32,29 @@ pub struct IdleTimeout {
 }
 
 impl IdleTimeout {
-    pub fn new(timeout: Duration) -> Self {
+    pub const fn new(timeout: Duration) -> Self {
         Self {
             timeout,
             state: IdleTimeoutState::Init,
             keep_alive_outstanding: false,
         }
     }
-}
-
-impl IdleTimeout {
     pub fn set_peer_timeout(&mut self, peer_timeout: Duration) {
         self.timeout = min(self.timeout, peer_timeout);
     }
 
-    pub fn expiry(&self, now: Instant, pto: Duration, keep_alive: bool) -> Instant {
-        let start = match self.state {
+    const fn start(&self, now: Instant) -> Instant {
+        match self.state {
             IdleTimeoutState::Init => now,
             IdleTimeoutState::PacketReceived(t) | IdleTimeoutState::AckElicitingPacketSent(t) => t,
-        };
-        let delay = if keep_alive && !self.keep_alive_outstanding {
-            // For a keep-alive timer, wait for half the timeout interval, but be sure
-            // not to wait too little or we will send many unnecessary probes.
-            max(self.timeout / 2, pto)
-        } else {
-            max(self.timeout, pto * 3)
-        };
-        qtrace!(
-            "IdleTimeout::expiry@{now:?} pto={pto:?}, ka={keep_alive} => {t:?}",
-            t = start + delay
-        );
-        start + delay
+        }
+    }
+
+    pub fn expiry(&self, now: Instant, pto: Duration) -> Instant {
+        let delay = max(self.timeout, pto * 3);
+        let t = self.start(now) + delay;
+        qtrace!("IdleTimeout::expiry@{now:?} pto={pto:?} => {t:?}");
+        t
     }
 
     pub fn on_packet_sent(&mut self, now: Instant) {
@@ -90,7 +84,28 @@ impl IdleTimeout {
     }
 
     pub fn expired(&self, now: Instant, pto: Duration) -> bool {
-        now >= self.expiry(now, pto, false)
+        now >= self.expiry(now, pto)
+    }
+
+    fn keep_alive_timeout(&self, now: Instant, pto: Duration) -> Instant {
+        // For a keep-alive timer, wait for half the timeout interval, but be sure
+        // not to wait too little or we will send many unnecessary probes.
+        self.start(now) + max(self.timeout / 2, pto)
+    }
+
+    pub fn next_keep_alive(&self, now: Instant, pto: Duration) -> Option<Instant> {
+        if self.keep_alive_outstanding {
+            return None;
+        }
+
+        let timeout = self.keep_alive_timeout(now, pto);
+        // Timer is in the past, i.e. we should have sent a keep alive,
+        // but we were unable to, e.g. due to CC.
+        if timeout <= now {
+            return None;
+        }
+
+        Some(timeout)
     }
 
     pub fn send_keep_alive(
@@ -99,7 +114,7 @@ impl IdleTimeout {
         pto: Duration,
         tokens: &mut Vec<RecoveryToken>,
     ) -> bool {
-        if !self.keep_alive_outstanding && now >= self.expiry(now, pto, true) {
+        if !self.keep_alive_outstanding && now >= self.keep_alive_timeout(now, pto) {
             self.keep_alive_outstanding = true;
             tokens.push(RecoveryToken::KeepAlive);
             true

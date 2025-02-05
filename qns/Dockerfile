@@ -1,67 +1,51 @@
-FROM martenseemann/quic-network-simulator-endpoint:latest AS buildimage
+FROM lukemathwalker/cargo-chef@sha256:ca7d16daba13bfc84d947cb16f54cdaf547c830b4292e58618ccb4747202ef23 AS chef
 
-# Which branch to build from.
-ARG NEQO_BRANCH=main
+WORKDIR /app
 
+FROM chef AS planner
+
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates coreutils curl git make mercurial ssh \
-    build-essential clang llvm libclang-dev lld \
-    gyp ninja-build pkg-config zlib1g-dev python \
- && apt-get autoremove -y && apt-get clean -y \
- && rm -rf /var/lib/apt/lists/*
+    libclang-dev gyp ninja-build python-is-python3 \
+    && apt-get autoremove -y && apt-get clean -y \
+    && rm -rf /var/lib/apt/lists/*
 
-ENV RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:$PATH \
-    RUST_VERSION=1.45.2
-
-RUN set -eux; \
-    curl -sSLf "https://static.rust-lang.org/rustup/archive/1.22.1/x86_64-unknown-linux-gnu/rustup-init" -o rustup-init; \
-    echo '49c96f3f74be82f4752b8bffcf81961dea5e6e94ce1ccba94435f12e871c3bdb *rustup-init' | sha256sum -c -; \
-    chmod +x rustup-init; \
-    ./rustup-init -y -q --no-modify-path --profile minimal --default-toolchain "$RUST_VERSION"; \
-    rm -f rustup-init; \
-    chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
-
+# We unfortunately need to build NSS from source, because the Debian package is
+# not compiled with support for SSLKEYLOGFILE.
+# See https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=842292
 ENV NSS_DIR=/nss \
+    NSS_TARGET=Release \
+    NSS_PREBUILT=1 \
     NSPR_DIR=/nspr \
     LD_LIBRARY_PATH=/dist/Release/lib
 
 RUN set -eux; \
-    hg clone https://hg.mozilla.org/projects/nss "$NSS_DIR"; \
-    hg clone https://hg.mozilla.org/projects/nspr "$NSPR_DIR"
+    git clone --depth=1 https://github.com/nss-dev/nspr "$NSPR_DIR"; \
+    git clone --depth=1 https://github.com/nss-dev/nss "$NSS_DIR"
 
 RUN "$NSS_DIR"/build.sh --static -Ddisable_tests=1 -o
 
-# Copy the .git directory from the local clone so that it is possible to create
-# an image that includes local updates.
-RUN mkdir -p /neqo-reference
-ADD . /neqo-reference
-RUN if [ -d /neqo-reference/.git ]; then \
-      source=/neqo-reference; \
-    else \
-      source=https://github.com/mozilla/neqo; \
-    fi; \
-    git clone --depth 1 --branch "$NEQO_BRANCH" "$source" /neqo; \
-    rm -rf /neqo-reference
-
+COPY --from=planner /app/recipe.json recipe.json
+# Build dependencies
+RUN cargo chef cook --release --recipe-path recipe.json
+# Build application
+ADD . /neqo
 RUN set -eux; \
     cd /neqo; \
-    RUSTFLAGS="-g -C link-arg=-fuse-ld=lld" cargo build --release \
-      --bin neqo-client --bin neqo-server; \
-    cp target/release/neqo-client target; \
-    cp target/release/neqo-server target; \
-    rm -rf target/release
+    CARGO_PROFILE_RELEASE_DEBUG=true cargo build --locked --release --bin neqo-client --bin neqo-server
 
 # Copy only binaries to the final image to keep it small.
 
-FROM martenseemann/quic-network-simulator-endpoint:latest
+FROM martenseemann/quic-network-simulator-endpoint@sha256:42d79cc04b88f2e4b4c8beb418b0843c123f26852ff6bbba4caa6badc0043d23
 
 ENV LD_LIBRARY_PATH=/neqo/lib
-COPY --from=buildimage /neqo/target/neqo-client /neqo/target/neqo-server /neqo/bin/
-COPY --from=buildimage /dist/Release/lib/*.so /neqo/lib/
-COPY --from=buildimage /dist/Release/bin/certutil /dist/Release/bin/pk12util /neqo/bin/
+COPY --from=builder /neqo/target/release/neqo-client /neqo/target/release/neqo-server /neqo/bin/
+COPY --from=builder /dist/Release/lib/*.so /neqo/lib/
+COPY --from=builder /dist/Release/bin/certutil /dist/Release/bin/pk12util /neqo/bin/
 
-COPY interop.sh /neqo/
+COPY qns/interop.sh /neqo/
 RUN chmod +x /neqo/interop.sh
 ENTRYPOINT [ "/neqo/interop.sh" ]

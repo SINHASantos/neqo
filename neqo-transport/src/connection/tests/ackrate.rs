@@ -4,15 +4,16 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use std::time::Duration;
+
+use test_fixture::{assertions, DEFAULT_ADDR_V4};
+
 use super::{
     super::{ConnectionParameters, ACK_RATIO_SCALE},
     ack_bytes, connect_rtt_idle, default_client, default_server, fill_cwnd, increase_cwnd,
     induce_persistent_congestion, new_client, new_server, send_something, DEFAULT_RTT,
 };
-use crate::stream_id::StreamType;
-
-use std::{mem, time::Duration};
-use test_fixture::{addr_v4, assertions};
+use crate::{connection::tests::assert_path_challenge_min_len, stream_id::StreamType};
 
 /// With the default RTT here (100ms) and default ratio (4), endpoints won't send
 /// `ACK_FREQUENCY` as the ACK delay isn't different enough from the default.
@@ -93,7 +94,7 @@ fn ack_rate_persistent_congestion() {
     let stream = client.stream_create(StreamType::UniDi).unwrap();
     let (dgrams, mut now) = fill_cwnd(&mut client, stream, now);
     now += RTT / 2;
-    mem::drop(ack_bytes(&mut server, stream, dgrams, now));
+    drop(ack_bytes(&mut server, stream, dgrams, now));
 
     let now = induce_persistent_congestion(&mut client, &mut server, stream, now);
 
@@ -163,11 +164,12 @@ fn migrate_ack_delay() {
     let mut now = connect_rtt_idle(&mut client, &mut server, DEFAULT_RTT);
 
     client
-        .migrate(Some(addr_v4()), Some(addr_v4()), true, now)
+        .migrate(Some(DEFAULT_ADDR_V4), Some(DEFAULT_ADDR_V4), true, now)
         .unwrap();
 
     let client1 = send_something(&mut client, now);
     assertions::assert_v4_path(&client1, true); // Contains PATH_CHALLENGE.
+    assert_path_challenge_min_len(&client, &client1, now);
     let client2 = send_something(&mut client, now);
     assertions::assert_v4_path(&client2, false); // Doesn't.  Is dropped.
     now += DEFAULT_RTT / 2;

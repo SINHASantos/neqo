@@ -4,22 +4,20 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use crate::frames::HFrame;
+use std::{cell::RefCell, cmp::min, fmt::Debug, num::NonZeroUsize, rc::Rc};
+
+use neqo_common::{qdebug, qtrace, Encoder, Header, MessageType};
+use neqo_qpack::encoder::QPackEncoder;
+use neqo_transport::{Connection, StreamId};
+
 use crate::{
+    frames::HFrame,
     headers_checks::{headers_valid, is_interim, trailers_valid},
-    qlog, BufferedStream, CloseType, Error, Http3StreamInfo, Http3StreamType, HttpSendStream, Res,
+    BufferedStream, CloseType, Error, Http3StreamInfo, Http3StreamType, HttpSendStream, Res,
     SendStream, SendStreamEvents, Stream,
 };
 
-use neqo_common::{qdebug, qinfo, qtrace, Encoder, Header, MessageType};
-use neqo_qpack::encoder::QPackEncoder;
-use neqo_transport::{streams::SendOrder, Connection, StreamId};
-use std::any::Any;
-use std::cell::RefCell;
-use std::cmp::min;
-use std::fmt::Debug;
-use std::rc::Rc;
-
+const MIN_DATA_FRAME_SIZE: usize = 3; // Minimal DATA frame size: 2 (header) + 1 (payload)
 const MAX_DATA_HEADER_SIZE_2: usize = (1 << 6) - 1; // Maximal amount of data with DATA frame header size 2
 const MAX_DATA_HEADER_SIZE_2_LIMIT: usize = MAX_DATA_HEADER_SIZE_2 + 3; // 63 + 3 (size of the next buffer data frame header)
 const MAX_DATA_HEADER_SIZE_3: usize = (1 << 14) - 1; // Maximal amount of data with DATA frame header size 3
@@ -29,7 +27,7 @@ const MAX_DATA_HEADER_SIZE_5_LIMIT: usize = MAX_DATA_HEADER_SIZE_5 + 9; // 10737
 
 /// A HTTP message, request and response, consists of headers, optional data and an optional
 /// trailer header block. This state machine does not reflect what was already sent to the
-/// transport layer but only reflect what has been supplied to the `SendMessage`.It is
+/// transport layer but only reflect what has been supplied to the `SendMessage`. It is
 /// represented by the following states:
 ///   `WaitingForHeaders` - the headers have not been supplied yet. In this state only a
 ///                         request/response header can be added. When headers are supplied
@@ -44,7 +42,6 @@ const MAX_DATA_HEADER_SIZE_5_LIMIT: usize = MAX_DATA_HEADER_SIZE_5 + 9; // 10737
 ///                   supply only a fin.
 ///   `Done` - in this state no more data or headers can be added. This state is entered when the
 ///            message is closed.
-
 #[derive(Debug, PartialEq)]
 enum MessageState {
     WaitingForHeaders,
@@ -105,7 +102,7 @@ impl MessageState {
 }
 
 #[derive(Debug)]
-pub(crate) struct SendMessage {
+pub struct SendMessage {
     state: MessageState,
     message_type: MessageType,
     stream_type: Http3StreamType,
@@ -122,7 +119,7 @@ impl SendMessage {
         encoder: Rc<RefCell<QPackEncoder>>,
         conn_events: Box<dyn SendStreamEvents>,
     ) -> Self {
-        qinfo!("Create a request stream_id={}", stream_id);
+        qdebug!("Create a request stream_id={stream_id}");
         Self {
             state: MessageState::WaitingForHeaders,
             message_type,
@@ -134,6 +131,7 @@ impl SendMessage {
     }
 
     /// # Errors
+    ///
     /// `ClosedCriticalStream` if the encoder stream is closed.
     /// `InternalError` if an unexpected error occurred.
     fn encode(
@@ -153,7 +151,7 @@ impl SendMessage {
     }
 
     fn stream_id(&self) -> StreamId {
-        Option::<StreamId>::from(&self.stream).unwrap()
+        Option::<StreamId>::from(&self.stream).expect("stream has ID")
     }
 
     fn get_stream_info(&self) -> Http3StreamInfo {
@@ -168,7 +166,7 @@ impl Stream for SendMessage {
 }
 impl SendStream for SendMessage {
     fn send_data(&mut self, conn: &mut Connection, buf: &[u8]) -> Res<usize> {
-        qtrace!([self], "send_body: len={}", buf.len());
+        qtrace!("[{self}] send_body: len={}", buf.len());
 
         self.state.new_data()?;
 
@@ -179,7 +177,14 @@ impl SendStream for SendMessage {
         let available = conn
             .stream_avail_send_space(self.stream_id())
             .map_err(|e| Error::map_stream_send_errors(&e.into()))?;
-        if available <= 2 {
+        if available < MIN_DATA_FRAME_SIZE {
+            // Setting this once, instead of every time the available send space
+            // is exhausted, would suffice. That said, function call should be
+            // cheap, thus not worth optimizing.
+            conn.stream_set_writable_event_low_watermark(
+                self.stream_id(),
+                NonZeroUsize::new(MIN_DATA_FRAME_SIZE).ok_or(Error::Internal)?,
+            )?;
             return Ok(0);
         }
         let to_send = if available <= MAX_DATA_HEADER_SIZE_2_LIMIT {
@@ -195,12 +200,7 @@ impl SendStream for SendMessage {
             min(buf.len(), available - 9)
         };
 
-        qinfo!(
-            [self],
-            "send_request_body: available={} to_send={}.",
-            available,
-            to_send
-        );
+        qdebug!("[{self}] send_request_body: available={available} to_send={to_send}");
 
         let data_frame = HFrame::Data {
             len: to_send as u64,
@@ -218,7 +218,6 @@ impl SendStream for SendMessage {
             .send_atomic(conn, &buf[..to_send])
             .map_err(|e| Error::map_stream_send_errors(&e))?;
         debug_assert!(sent);
-        qlog::h3_data_moved_down(conn.qlog_mut(), self.stream_id(), to_send);
         Ok(to_send)
     }
 
@@ -236,23 +235,24 @@ impl SendStream for SendMessage {
     }
 
     /// # Errors
+    ///
     /// `InternalError` if an unexpected error occurred.
     /// `InvalidStreamId` if the stream does not exist,
     /// `AlreadyClosed` if the stream has already been closed.
-    /// `TransportStreamDoesNotExist` if the transport stream does not exist (this may happen if `process_output`
-    /// has not been called when needed, and HTTP3 layer has not picked up the info that the stream has been closed.)
+    /// `TransportStreamDoesNotExist` if the transport stream does not exist (this may happen if
+    /// `process_output` has not been called when needed, and HTTP3 layer has not picked up the
+    /// info that the stream has been closed.)
     fn send(&mut self, conn: &mut Connection) -> Res<()> {
         let sent = Error::map_error(self.stream.send_buffer(conn), Error::HttpInternal(5))?;
-        qlog::h3_data_moved_down(conn.qlog_mut(), self.stream_id(), sent);
 
-        qtrace!([self], "{} bytes sent", sent);
+        qtrace!("[{self}] {sent} bytes sent");
         if !self.stream.has_buffered_data() {
             if self.state.done() {
                 Error::map_error(
                     conn.stream_close_send(self.stream_id()),
                     Error::HttpInternal(6),
                 )?;
-                qtrace!([self], "done sending request");
+                qtrace!("[{self}] done sending request");
             } else {
                 // DataWritable is just a signal for an application to try to write more data,
                 // if writing fails it is fine. Therefore we do not need to properly check
@@ -268,16 +268,6 @@ impl SendStream for SendMessage {
     // http client afterwards using `send_request_body` after receiving DataWritable event.
     fn has_data_to_send(&self) -> bool {
         self.stream.has_buffered_data()
-    }
-
-    fn set_sendorder(&mut self, _conn: &mut Connection, _sendorder: Option<SendOrder>) -> Res<()> {
-        // Not relevant for SendMessage
-        Ok(())
-    }
-
-    fn set_fairness(&mut self, _conn: &mut Connection, _fairness: bool) -> Res<()> {
-        // Not relevant for SendMessage
-        Ok(())
     }
 
     fn close(&mut self, conn: &mut Connection) -> Res<()> {
@@ -318,7 +308,7 @@ impl SendStream for SendMessage {
 impl HttpSendStream for SendMessage {
     fn send_headers(&mut self, headers: &[Header], conn: &mut Connection) -> Res<()> {
         self.state.new_headers(headers, self.message_type)?;
-        let buf = SendMessage::encode(
+        let buf = Self::encode(
             &mut self.encoder.borrow_mut(),
             headers,
             conn,
@@ -331,10 +321,6 @@ impl HttpSendStream for SendMessage {
     fn set_new_listener(&mut self, conn_events: Box<dyn SendStreamEvents>) {
         self.stream_type = Http3StreamType::ExtendedConnect;
         self.conn_events = conn_events;
-    }
-
-    fn any(&self) -> &dyn Any {
-        self
     }
 }
 
