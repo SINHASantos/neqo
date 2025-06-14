@@ -780,7 +780,7 @@ impl Connection {
         }
         self.paths
             .primary()
-            .ok_or(Error::InternalError)?
+            .ok_or(Error::Internal)?
             .borrow_mut()
             .rtt_mut()
             .set_initial(rtt);
@@ -1446,7 +1446,7 @@ impl Connection {
                     if versions.is_empty()
                         || versions.contains(&self.version().wire_version())
                         || versions.contains(&0)
-                        || &packet.scid() != self.odcid().ok_or(Error::InternalError)?
+                        || &packet.scid() != self.odcid().ok_or(Error::Internal)?
                         || matches!(self.address_validation, AddressValidationInfo::Retry { .. })
                     {
                         // Ignore VersionNegotiation packets that contain the current version.
@@ -1787,7 +1787,12 @@ impl Connection {
             .acks
             .get_mut(PacketNumberSpace::from(packet.packet_type()))
         {
-            space.set_received(now, packet.pn(), ack_eliciting)?
+            space.set_received(
+                now,
+                packet.pn(),
+                ack_eliciting,
+                &mut self.stats.borrow_mut(),
+            )?
         } else {
             qdebug!(
                 "[{self}] processed a {:?} packet without tracking it",
@@ -2080,7 +2085,7 @@ impl Connection {
                         // than reuse a connection ID.
                         let res = if path.borrow().is_temporary() {
                             qerror!("[{self}] Attempting to close with a temporary path");
-                            Err(Error::InternalError)
+                            Err(Error::Internal)
                         } else {
                             self.output_path(&path, now, Some(&details))
                         };
@@ -2092,6 +2097,7 @@ impl Connection {
         res.unwrap_or_default()
     }
 
+    #[expect(clippy::too_many_arguments, reason = "no easy way to simplify")]
     fn build_packet_header(
         path: &Path,
         epoch: Epoch,
@@ -2100,18 +2106,26 @@ impl Connection {
         address_validation: &AddressValidationInfo,
         version: Version,
         grease_quic_bit: bool,
+        limit: usize,
     ) -> (PacketType, PacketBuilder) {
         let pt = PacketType::from(epoch);
         let mut builder = if pt == PacketType::Short {
             qdebug!("Building Short dcid {:?}", path.remote_cid());
-            PacketBuilder::short(encoder, tx.key_phase(), path.remote_cid())
+            PacketBuilder::short(encoder, tx.key_phase(), path.remote_cid(), limit)
         } else {
             qdebug!(
                 "Building {pt:?} dcid {:?} scid {:?}",
                 path.remote_cid(),
                 path.local_cid(),
             );
-            PacketBuilder::long(encoder, pt, version, path.remote_cid(), path.local_cid())
+            PacketBuilder::long(
+                encoder,
+                pt,
+                version,
+                path.remote_cid(),
+                path.local_cid(),
+                limit,
+            )
         };
         if builder.remaining() > 0 {
             builder.scramble(grease_quic_bit);
@@ -2459,8 +2473,19 @@ impl Connection {
             else {
                 continue;
             };
+            let aead_expansion = CryptoDxState::expansion();
 
             let header_start = encoder.len();
+
+            // Configure the limits and padding for this packet.
+            let limit = if path.borrow().pmtud().needs_probe() {
+                needs_padding = true;
+                debug_assert!(path.borrow().pmtud().probe_size() >= profile.limit());
+                path.borrow().pmtud().probe_size() - aead_expansion
+            } else {
+                profile.limit() - aead_expansion
+            };
+
             let (pt, mut builder) = Self::build_packet_header(
                 &path.borrow(),
                 epoch,
@@ -2469,6 +2494,7 @@ impl Connection {
                 &self.address_validation,
                 version,
                 grease_quic_bit,
+                limit,
             );
             let pn = Self::add_packet_number(
                 &mut builder,
@@ -2481,17 +2507,6 @@ impl Connection {
                 break;
             }
 
-            // Configure the limits and padding for this packet.
-            let aead_expansion = tx.expansion();
-            needs_padding |= builder.set_initial_limit(
-                &profile,
-                aead_expansion,
-                self.paths
-                    .primary()
-                    .ok_or(Error::InternalError)?
-                    .borrow()
-                    .pmtud(),
-            );
             builder.enable_padding(needs_padding);
             if builder.is_full() {
                 encoder = builder.abort();
@@ -2533,7 +2548,7 @@ impl Connection {
                 .crypto
                 .states_mut()
                 .tx_mut(self.version, epoch)
-                .ok_or(Error::InternalError)?;
+                .ok_or(Error::Internal)?;
             encoder = builder.build(tx)?;
             self.crypto.states_mut().auto_update()?;
 
@@ -2709,9 +2724,7 @@ impl Connection {
         self.validate_versions()?;
         {
             let tps = self.tps.borrow();
-            let remote = tps
-                .remote_handshake()
-                .ok_or(Error::TransportParameterError)?;
+            let remote = tps.remote_handshake().ok_or(Error::TransportParameter)?;
 
             // If the peer provided a preferred address, then we have to be a client
             // and they have to be using a non-empty connection ID.
@@ -2723,12 +2736,12 @@ impl Connection {
                         .ok_or(Error::UnknownConnectionId)?
                         .is_empty())
             {
-                return Err(Error::TransportParameterError);
+                return Err(Error::TransportParameter);
             }
 
             let reset_token = remote.get_bytes(StatelessResetToken).map_or_else(
                 || Ok(ConnectionIdEntry::random_srt()),
-                |token| <[u8; 16]>::try_from(token).map_err(|_| Error::TransportParameterError),
+                |token| <[u8; 16]>::try_from(token).map_err(|_| Error::TransportParameter),
             )?;
             let path = self.paths.primary().ok_or(Error::NoAvailablePath)?;
             path.borrow_mut().set_reset_token(reset_token);
@@ -2737,7 +2750,7 @@ impl Connection {
             let min_ad = if remote.has_value(MinAckDelay) {
                 let min_ad = Duration::from_micros(remote.get_integer(MinAckDelay));
                 if min_ad > max_ad {
-                    return Err(Error::TransportParameterError);
+                    return Err(Error::TransportParameter);
                 }
                 Some(min_ad)
             } else {
@@ -2756,9 +2769,7 @@ impl Connection {
 
     fn validate_cids(&self) -> Res<()> {
         let tph = self.tps.borrow();
-        let remote_tps = tph
-            .remote_handshake()
-            .ok_or(Error::TransportParameterError)?;
+        let remote_tps = tph.remote_handshake().ok_or(Error::TransportParameter)?;
 
         let tp = remote_tps.get_bytes(InitialSourceConnectionId);
         if self
@@ -2815,9 +2826,7 @@ impl Connection {
     /// Validate the `version_negotiation` transport parameter from the peer.
     fn validate_versions(&self) -> Res<()> {
         let tph = self.tps.borrow();
-        let remote_tps = tph
-            .remote_handshake()
-            .ok_or(Error::TransportParameterError)?;
+        let remote_tps = tph.remote_handshake().ok_or(Error::TransportParameter)?;
         // `current` and `other` are the value from the peer's transport parameters.
         // We're checking that these match our expectations.
         if let Some((current, other)) = remote_tps.get_versions() {
@@ -2926,7 +2935,7 @@ impl Connection {
             }
             _ => {
                 qerror!("Crypto state should not be new or failed after successful handshake");
-                return Err(Error::CryptoError(neqo_crypto::Error::InternalError));
+                return Err(Error::Crypto(neqo_crypto::Error::Internal));
             }
         }
 
@@ -2951,7 +2960,7 @@ impl Connection {
         if self.conn_params.pmtud_enabled() {
             self.paths
                 .primary()
-                .ok_or(Error::InternalError)?
+                .ok_or(Error::Internal)?
                 .borrow_mut()
                 .pmtud_mut()
                 .start(now, &mut self.stats.borrow_mut());
@@ -3092,12 +3101,12 @@ impl Connection {
                     // Use a transport error here because we want to send
                     // NO_ERROR in this case.
                     (
-                        Error::PeerApplicationError(error_code.code()),
+                        Error::PeerApplication(error_code.code()),
                         FrameType::ConnectionCloseApplication,
                     )
                 } else {
                     (
-                        Error::PeerError(error_code.code()),
+                        Error::Peer(error_code.code()),
                         FrameType::ConnectionCloseTransport,
                     )
                 };
@@ -3302,7 +3311,7 @@ impl Connection {
                 .crypto
                 .tls()
                 .info()
-                .ok_or(Error::InternalError)?
+                .ok_or(Error::Internal)?
                 .early_data_accepted()
             {
                 ZeroRttState::AcceptedClient
@@ -3320,12 +3329,8 @@ impl Connection {
         self.set_state(State::Connected, now);
         self.create_resumption_token(now);
         self.saved_datagrams.make_available(Epoch::ApplicationData);
-        self.stats.borrow_mut().resumed = self
-            .crypto
-            .tls()
-            .info()
-            .ok_or(Error::InternalError)?
-            .resumed();
+        self.stats.borrow_mut().resumed =
+            self.crypto.tls().info().ok_or(Error::Internal)?.resumed();
         if self.role == Role::Server {
             self.state_signaling.handshake_done();
             self.set_confirmed(now)?;
@@ -3610,6 +3615,7 @@ impl Connection {
             &self.address_validation,
             version,
             false,
+            usize::MAX,
         );
         _ = Self::add_packet_number(
             &mut builder,
@@ -3619,7 +3625,7 @@ impl Connection {
         );
 
         let data_len_possible =
-            u64::try_from(mtu.saturating_sub(tx.expansion() + builder.len() + 1))?;
+            u64::try_from(mtu.saturating_sub(CryptoDxState::expansion() + builder.len() + 1))?;
         Ok(min(data_len_possible, max_dgram_size))
     }
 
