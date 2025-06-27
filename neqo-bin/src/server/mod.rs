@@ -4,10 +4,6 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-#![allow(
-    clippy::module_name_repetitions,
-    reason = "<https://github.com/mozilla/neqo/issues/2284#issuecomment-2782711813>"
-)]
 #![expect(
     clippy::unwrap_used,
     clippy::future_not_send,
@@ -51,41 +47,41 @@ mod http3;
 
 #[derive(Debug)]
 pub enum Error {
-    ArgumentError(&'static str),
-    Http3Error(neqo_http3::Error),
-    IoError(io::Error),
-    QlogError,
-    TransportError(neqo_transport::Error),
-    CryptoError(neqo_crypto::Error),
+    Argument(&'static str),
+    Http3(neqo_http3::Error),
+    Io(io::Error),
+    Qlog,
+    Transport(neqo_transport::Error),
+    Crypto(neqo_crypto::Error),
 }
 
 impl From<neqo_crypto::Error> for Error {
     fn from(err: neqo_crypto::Error) -> Self {
-        Self::CryptoError(err)
+        Self::Crypto(err)
     }
 }
 
 impl From<io::Error> for Error {
     fn from(err: io::Error) -> Self {
-        Self::IoError(err)
+        Self::Io(err)
     }
 }
 
 impl From<neqo_http3::Error> for Error {
     fn from(err: neqo_http3::Error) -> Self {
-        Self::Http3Error(err)
+        Self::Http3(err)
     }
 }
 
 impl From<qlog::Error> for Error {
     fn from(_err: qlog::Error) -> Self {
-        Self::QlogError
+        Self::Qlog
     }
 }
 
 impl From<neqo_transport::Error> for Error {
     fn from(err: neqo_transport::Error) -> Self {
-        Self::TransportError(err)
+        Self::Transport(err)
     }
 }
 
@@ -204,13 +200,14 @@ fn qns_read_response(filename: &str) -> Result<Vec<u8>, io::Error> {
     fs::read(path)
 }
 
+#[expect(clippy::module_name_repetitions, reason = "This is OK.")]
 pub trait HttpServer: Display {
     fn process(&mut self, dgram: Option<Datagram<&mut [u8]>>, now: Instant) -> Output;
     fn process_events(&mut self, now: Instant);
     fn has_events(&self) -> bool;
 }
 
-pub struct ServerRunner {
+pub struct Runner {
     now: Box<dyn Fn() -> Instant>,
     server: Box<dyn HttpServer>,
     timeout: Option<Pin<Box<Sleep>>>,
@@ -218,7 +215,7 @@ pub struct ServerRunner {
     recv_buf: RecvBuf,
 }
 
-impl ServerRunner {
+impl Runner {
     #[must_use]
     pub fn new(
         now: Box<dyn Fn() -> Instant>,
@@ -372,7 +369,7 @@ enum Ready {
     Timeout,
 }
 
-pub fn server(mut args: Args) -> Res<ServerRunner> {
+pub fn server(mut args: Args) -> Res<Runner> {
     neqo_common::log::init(
         args.shared
             .verbose
@@ -452,9 +449,5 @@ pub fn server(mut args: Args) -> Res<ServerRunner> {
         )
     };
 
-    Ok(ServerRunner::new(
-        Box::new(move || args.now()),
-        server,
-        sockets,
-    ))
+    Ok(Runner::new(Box::new(move || args.now()), server, sockets))
 }

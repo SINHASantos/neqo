@@ -6,7 +6,6 @@
 
 use std::{
     cell::{RefCell, RefMut},
-    collections::HashMap,
     fmt::{self, Display, Formatter},
     path::PathBuf,
     rc::Rc,
@@ -19,6 +18,7 @@ use neqo_transport::{
     server::{ConnectionRef, Server, ValidateAddress},
     ConnectionIdGenerator, Output,
 };
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::{
     connection::Http3State,
@@ -74,7 +74,7 @@ impl Http3Server {
                 http3_parameters.get_connection_parameters().clone(),
             )?,
             http3_parameters,
-            http3_handlers: HashMap::new(),
+            http3_handlers: HashMap::default(),
             events: Http3ServerEvents::default(),
         })
     }
@@ -336,7 +336,7 @@ mod tests {
 
     use neqo_common::{event::Provider as _, Encoder};
     use neqo_crypto::{AuthenticationStatus, ZeroRttCheckResult, ZeroRttChecker};
-    use neqo_qpack::{encoder::QPackEncoder, QpackSettings};
+    use neqo_qpack as qpack;
     use neqo_transport::{
         CloseReason, Connection, ConnectionEvent, State, StreamId, StreamType, ZeroRttState,
     };
@@ -348,13 +348,13 @@ mod tests {
     use super::{Http3Server, Http3ServerEvent, Http3State, Rc, RefCell};
     use crate::{Error, HFrame, Header, Http3Parameters, Priority};
 
-    const DEFAULT_SETTINGS: QpackSettings = QpackSettings {
+    const DEFAULT_SETTINGS: qpack::Settings = qpack::Settings {
         max_table_size_encoder: 100,
         max_table_size_decoder: 100,
         max_blocked_streams: 100,
     };
 
-    fn http3params(qpack_settings: QpackSettings) -> Http3Parameters {
+    fn http3params(qpack_settings: qpack::Settings) -> Http3Parameters {
         Http3Parameters::default()
             .max_table_size_encoder(qpack_settings.max_table_size_encoder)
             .max_table_size_decoder(qpack_settings.max_table_size_decoder)
@@ -566,8 +566,8 @@ mod tests {
             &[0x0, 0x4, 0x6, 0x1, 0x40, 0x64, 0x7, 0x40, 0x64],
         );
         assert_eq!(sent, Ok(9));
-        let mut encoder = QPackEncoder::new(
-            &QpackSettings {
+        let mut encoder = qpack::Encoder::new(
+            &qpack::Settings {
                 max_table_size_encoder: 100,
                 max_table_size_decoder: 0,
                 max_blocked_streams: 0,
@@ -977,9 +977,7 @@ mod tests {
                     check_request_header(&headers);
                     assert!(!fin);
                     headers_frames += 1;
-                    stream
-                        .stream_stop_sending(Error::HttpNoError.code())
-                        .unwrap();
+                    stream.stream_stop_sending(Error::HttpNone.code()).unwrap();
                     stream
                         .send_headers(&[
                             Header::new(":status", "200"),
@@ -1102,7 +1100,7 @@ mod tests {
     fn server_reset_control_stream() {
         let (mut hconn, mut peer_conn) = connect();
         peer_conn
-            .stream_reset_send(CLIENT_SIDE_CONTROL_STREAM_ID, Error::HttpNoError.code())
+            .stream_reset_send(CLIENT_SIDE_CONTROL_STREAM_ID, Error::HttpNone.code())
             .unwrap();
         let out = peer_conn.process_output(now());
         hconn.process(out.dgram(), now());
@@ -1115,7 +1113,7 @@ mod tests {
     fn server_reset_client_side_encoder_stream() {
         let (mut hconn, mut peer_conn) = connect();
         peer_conn
-            .stream_reset_send(CLIENT_SIDE_ENCODER_STREAM_ID, Error::HttpNoError.code())
+            .stream_reset_send(CLIENT_SIDE_ENCODER_STREAM_ID, Error::HttpNone.code())
             .unwrap();
         let out = peer_conn.process_output(now());
         hconn.process(out.dgram(), now());
@@ -1128,7 +1126,7 @@ mod tests {
     fn server_reset_client_side_decoder_stream() {
         let (mut hconn, mut peer_conn) = connect();
         peer_conn
-            .stream_reset_send(CLIENT_SIDE_DECODER_STREAM_ID, Error::HttpNoError.code())
+            .stream_reset_send(CLIENT_SIDE_DECODER_STREAM_ID, Error::HttpNone.code())
             .unwrap();
         let out = peer_conn.process_output(now());
         hconn.process(out.dgram(), now());
@@ -1142,7 +1140,7 @@ mod tests {
         let (mut hconn, mut peer_conn) = connect();
 
         peer_conn
-            .stream_stop_sending(SERVER_SIDE_CONTROL_STREAM_ID, Error::HttpNoError.code())
+            .stream_stop_sending(SERVER_SIDE_CONTROL_STREAM_ID, Error::HttpNone.code())
             .unwrap();
         let out = peer_conn.process_output(now());
         hconn.process(out.dgram(), now());
@@ -1155,7 +1153,7 @@ mod tests {
     fn server_stop_sending_encoder_stream() {
         let (mut hconn, mut peer_conn) = connect();
         peer_conn
-            .stream_stop_sending(SERVER_SIDE_ENCODER_STREAM_ID, Error::HttpNoError.code())
+            .stream_stop_sending(SERVER_SIDE_ENCODER_STREAM_ID, Error::HttpNone.code())
             .unwrap();
         let out = peer_conn.process_output(now());
         hconn.process(out.dgram(), now());
@@ -1168,7 +1166,7 @@ mod tests {
     fn server_stop_sending_decoder_stream() {
         let (mut hconn, mut peer_conn) = connect();
         peer_conn
-            .stream_stop_sending(SERVER_SIDE_DECODER_STREAM_ID, Error::HttpNoError.code())
+            .stream_stop_sending(SERVER_SIDE_DECODER_STREAM_ID, Error::HttpNone.code())
             .unwrap();
         let out = peer_conn.process_output(now());
         hconn.process(out.dgram(), now());
@@ -1206,7 +1204,7 @@ mod tests {
     #[test]
     fn zero_rtt_larger_decoder_table() {
         zero_rtt_with_settings(
-            http3params(QpackSettings {
+            http3params(qpack::Settings {
                 max_table_size_decoder: DEFAULT_SETTINGS.max_table_size_decoder + 1,
                 ..DEFAULT_SETTINGS
             }),
@@ -1218,7 +1216,7 @@ mod tests {
     #[test]
     fn zero_rtt_smaller_decoder_table() {
         zero_rtt_with_settings(
-            http3params(QpackSettings {
+            http3params(qpack::Settings {
                 max_table_size_decoder: DEFAULT_SETTINGS.max_table_size_decoder - 1,
                 ..DEFAULT_SETTINGS
             }),
@@ -1230,7 +1228,7 @@ mod tests {
     #[test]
     fn zero_rtt_more_blocked_streams() {
         zero_rtt_with_settings(
-            http3params(QpackSettings {
+            http3params(qpack::Settings {
                 max_blocked_streams: DEFAULT_SETTINGS.max_blocked_streams + 1,
                 ..DEFAULT_SETTINGS
             }),
@@ -1242,7 +1240,7 @@ mod tests {
     #[test]
     fn zero_rtt_fewer_blocked_streams() {
         zero_rtt_with_settings(
-            http3params(QpackSettings {
+            http3params(qpack::Settings {
                 max_blocked_streams: DEFAULT_SETTINGS.max_blocked_streams - 1,
                 ..DEFAULT_SETTINGS
             }),
@@ -1254,7 +1252,7 @@ mod tests {
     #[test]
     fn zero_rtt_smaller_encoder_table() {
         zero_rtt_with_settings(
-            http3params(QpackSettings {
+            http3params(qpack::Settings {
                 max_table_size_encoder: DEFAULT_SETTINGS.max_table_size_encoder - 1,
                 ..DEFAULT_SETTINGS
             }),
