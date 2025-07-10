@@ -33,6 +33,7 @@ defaults:
 
 jobs:
   toolchains:
+    name: Determine toolchains
     runs-on: ubuntu-24.04
     outputs:
       toolchains: ${{ steps.toolchains.outputs.toolchains }}
@@ -48,11 +49,12 @@ jobs:
           echo "toolchains=[\"$msrv\", \"stable\", \"nightly\"]" >> "$GITHUB_OUTPUT"
 
   check:
+    name: Run checks
     needs: toolchains
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14, windows-2025]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-2025]
         rust-toolchain: ${{ fromJSON(needs.toolchains.outputs.toolchains) }}
         type: [debug]
         # Include some dynamically-linked release builds, to check that that works on all platforms.
@@ -60,7 +62,7 @@ jobs:
           - os: ubuntu-24.04
             rust-toolchain: stable
             type: release
-          - os: macos-14
+          - os: macos-15
             rust-toolchain: stable
             type: release
           - os: windows-2025
@@ -98,7 +100,7 @@ jobs:
         with:
           version: ${{ matrix.rust-toolchain }}
           components: ${{ matrix.rust-toolchain == 'stable' && 'llvm-tools' || '' }}
-          tools: ${{ matrix.rust-toolchain == 'stable' && 'cargo-llvm-cov, ' || '' }} junit-test
+          tools: ${{ matrix.rust-toolchain == 'stable' && 'cargo-llvm-cov' || '' }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - id: nss-version
@@ -130,8 +132,6 @@ jobs:
           else
             cargo test $BUILD_TYPE --locked --features ci
           fi
-          # shellcheck disable=SC2086
-          junit-test $BUILD_TYPE
 
       - name: Run client/server transfer
         run: |
@@ -167,14 +167,6 @@ jobs:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
         if: matrix.type == 'debug' && matrix.rust-toolchain == 'stable'
 
-      - uses: codecov/test-results-action@47f89e9acb64b76debcd5ea40642d25a4adced9f # v1.1.1
-        if: ${{ always() }}
-        with:
-          files: junit.xml
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
-          verbose: true
-
       - name: Save simulation seeds artifact
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -192,13 +184,9 @@ jobs:
           persist-credentials: false
       - run: cargo update -w --locked
 
-  bench:
-    needs: [check]
-    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || github.event.inputs.run_benchmarks) && github.actor != 'dependabot[bot]' && github.event_name != 'merge_group' }}
-    uses: ./.github/workflows/bench.yml
-
   check-android:
-    runs-on: ubuntu-latest
+    name: Check Android
+    runs-on: ubuntu-24.04
     env:
       # https://searchfox.org/mozilla-central/search?q=NDK_VERSION =&path=python/mozboot/mozboot/android.py
       NDK_VERSION: 27.2.12479018 # r27c
@@ -230,7 +218,7 @@ jobs:
           java-version: 23
 
       - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
-      - run: sdkmanager --install "ndk;${{ env.NDK_VERSION }}"
+      - run: sdkmanager --install "ndk;$NDK_VERSION"
 
       - uses: ./.github/actions/rust
         with:
@@ -247,7 +235,9 @@ jobs:
           minimum-version: ${{ steps.nss-version.outputs.minimum }}
           target: ${{ matrix.target }}
 
-      - run: cargo ndk --bindgen --platform "$API_LEVEL" --target ${{ matrix.target }} test --no-run
+      - env:
+          MATRIX_TARGET: ${{ matrix.target }}
+        run: cargo ndk --bindgen --platform "$API_LEVEL" --target "$MATRIX_TARGET" test --no-run
 
       - env:
           TARGET: ${{ matrix.target }}
